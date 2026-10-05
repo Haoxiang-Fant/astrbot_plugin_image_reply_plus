@@ -1,0 +1,12 @@
+{
+  "require_wake": {
+    "description": "开启后需 @机器人/唤醒前缀 才响应关键词，避免误触发；关闭则首词命中关键词即回复。",
+    "type": "bool",
+    "default": false
+  },
+  "watermark": {
+    "description": "发送时在图片下方附加 文件名/PID 信息条（仅发送环节生成，不修改原图，GIF 直接原样发送）。",
+    "type": "bool",
+    "default": true
+  }
+}

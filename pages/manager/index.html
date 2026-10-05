@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图库plus</title>
+<style>
+/* 跟随 AstrBot 亮暗主题（bridge 会在 <html> 上维护 data-theme） */
+:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456}
+[data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab}
+body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:960px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
+h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h2 small{color:var(--sub);font-weight:normal;font-size:13px}
+.spacer{flex:1}
+.bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+input,button{padding:8px 12px;border-radius:6px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
+button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
+label.up{cursor:pointer;color:var(--fg);background:var(--ctrl);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-size:14px}
+label.up:hover{background:var(--ctrl-hover)}
+.g{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px;margin-bottom:16px}
+.g h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.grid{display:flex;flex-wrap:wrap;gap:10px}
+.item{position:relative}
+.item img{width:120px;height:120px;object-fit:cover;border-radius:6px;display:block;background:#000}
+.item .x{position:absolute;top:2px;right:2px;background:#c0392b;border:none;color:#fff;border-radius:4px;padding:1px 7px;cursor:pointer}
+.item .x.arm{background:#e67e22}
+.item .pid{font-size:11px;color:var(--pid);margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.err{color:#e74c3c;white-space:pre-wrap;word-break:break-all}
+.hint{color:var(--sub);font-size:13px;margin:6px 0 10px;line-height:1.7}
+code{background:var(--ctrl);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-family:ui-monospace,Consolas,monospace}
+#pattern{width:100%;font-family:ui-monospace,Consolas,monospace}
+#import-result p{margin:8px 0}
+#import-result ul{margin:6px 0;padding-left:20px}
+#import-result .g h3{margin:14px 0 8px}
+#import-result .g h3:first-child{margin-top:0}
+#import-result details{margin-top:12px}
+small{color:var(--sub)}
+</style>
+</head>
+<body>
+<h2>
+  <span>图库plus <small>关键词图库管理</small></span>
+  <span class="spacer"></span>
+  <button id="btn-import" onclick="showImport()">批量导入</button>
+  <button id="btn-back" onclick="showMain()" hidden>返回图库</button>
+</h2>
+
+<div id="view-main">
+  <div class="bar">
+    <input id="kw" placeholder="新关键词，如：可琳照片">
+    <button onclick="run(create)">创建关键词</button>
+  </div>
+  <div id="list">加载中…</div>
+</div>
+
+<div id="view-import" hidden>
+  <div class="g">
+    <h3>文件名格式（搭积木）</h3>
+    <div class="bar">
+      <button onclick="insertBlock('{图库名}')">＋ 图库名</button>
+      <button onclick="insertBlock('{编号}')">＋ 编号</button>
+      <button onclick="insertBlock('{pid}')">＋ pid</button>
+      <button onclick="insertBlock('{扩展名}')">＋ 扩展名</button>
+      <button onclick="insertBlock('-')">＋ -</button>
+      <button onclick="insertBlock('_')">＋ _</button>
+      <button onclick="insertBlock('.')">＋ .</button>
+    </div>
+    <input id="pattern" value="{图库名}-{编号}.{扩展名}" spellcheck="false">
+    <div class="hint">
+      点上面的积木按钮按顺序拼出你的文件名；分隔符可自己敲。<br>
+      <code>{图库名}</code> 决定归到哪个图库（必填）｜<code>{编号}</code> 数字序号（仅用于匹配，入库时重新编号）｜
+      <code>{pid}</code> pixiv 作品号，会记录到 pids.json｜<code>{扩展名}</code> 文件后缀<br>
+      例：<code>{图库名}-{编号}.{扩展名}</code> → <code>可琳照片-1.jpg</code> 归入「可琳照片」；
+      <code>{图库名}_{pid}.{扩展名}</code> → <code>可琳照片_95026140_p0.jpg</code> 归入「可琳照片」并记 PID。
+    </div>
+    <div class="bar">
+      <button onclick="setPattern('{图库名}-{编号}.{扩展名}')">预设：图库名-编号.扩展名</button>
+      <button onclick="setPattern('{图库名}_{pid}.{扩展名}')">预设：图库名_pid.扩展名</button>
+      <button onclick="setPattern('{编号}_{图库名}.{扩展名}')">预设：编号_图库名.扩展名</button>
+    </div>
+    <div class="bar">
+      <input type="file" id="import-files" accept="image/*" multiple>
+      <button onclick="run(doImport)">开始导入</button>
+    </div>
+    <div id="import-result"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// 受限 iframe 里 alert/confirm 会被静默吞掉，所有反馈一律渲染进页面
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fail(e){
+  console.error(e);
+  const box = $('#import-result') && !$('#view-import').hidden ? $('#import-result') : $('#list');
+  if (box) box.insertAdjacentHTML('afterbegin',
+    `<p class="err">出错了：${esc((e && e.message) || e)}\n（若提示 bridge 未加载，说明当前 AstrBot 版本不支持插件 Pages）</p>`);
+}
+window.onerror = (m) => { fail(m); };
+window.addEventListener('unhandledrejection', e => fail(e.reason));
+
+let B = null; // bridge 惰性获取：SDK 由仪表盘自动注入，时机不定，轮询等它出现
+function whenBridge(ms = 10000){
+  return new Promise((ok, bad) => {
+    const t0 = Date.now();
+    (function poll(){
+      if (window.AstrBotPluginPage) return ok(window.AstrBotPluginPage);
+      if (Date.now() - t0 > ms) return bad(new Error('bridge 未加载（AstrBot 版本可能不支持插件 Pages，或需要重载插件）'));
+      setTimeout(poll, 50);
+    })();
+  });
+}
+
+// bridge 方法名如有出入，只需改这两行包装
+const apiGet  = (p, params) => B.apiGet(p, params);
+const apiPost = (p, body)   => B.apiPost(p, body);
+// 所有操作走单端点 + action 协议
+const act = (body) => apiPost('galleries', body);
+
+// 兼容原始返回或 {status,data} 信封两种响应形态
+const pick = (body, key) => (body && body.data && body.data[key] !== undefined) ? body.data[key] : body ? body[key] : undefined;
+
+async function run(fn){
+  try { await fn(); } catch (e) { fail(e); }
+}
+
+function showImport(){
+  $('#view-main').hidden = true;
+  $('#view-import').hidden = false;
+  $('#btn-import').hidden = true;
+  $('#btn-back').hidden = false;
+  $('#import-result').innerHTML = '';
+}
+function showMain(){
+  $('#view-import').hidden = true;
+  $('#view-main').hidden = false;
+  $('#btn-import').hidden = false;
+  $('#btn-back').hidden = true;
+  run(load);
+}
+
+// ---------- 图库管理 ----------
+
+async function load(){
+  const body = await apiGet('galleries');
+  const galleries = pick(body, 'galleries') || [];
+  const list = $('#list');
+  list.innerHTML = galleries.length ? '' : '暂无关键词，先创建一个。';
+  for (const g of galleries) {
+    const d = document.createElement('div');
+    d.className = 'g';
+    d.innerHTML = `<h3><span>${esc(g.name)} <small>${g.count} 张</small></span>
+      <span><label class="up">＋上传图片<input type="file" accept="image/*" multiple hidden
+        onchange="run(() => upload('${esc(g.name)}', this.files))"></label>
+      <button onclick="run(() => delG('${esc(g.name)}', this))">删除图库</button></span></h3><div class="grid"></div>`;
+    const grid = d.querySelector('.grid');
+    for (const im of g.images) {
+      const it = document.createElement('div');
+      it.className = 'item';
+      it.innerHTML = `<button class="x" onclick="run(() => delI('${esc(g.name)}','${esc(im.file)}', this))">✕</button>
+        <div class="pid" title="${esc(im.pid || '')}">${im.pid ? 'PID:' + esc(im.pid) : '无PID'}</div>`;
+      const img = document.createElement('img');
+      act({action: 'raw', name: g.name, image: im.file})
+        .then(p => { const src = pick(p, 'data'); if (src) img.src = src; })
+        .catch(() => {});
+      it.prepend(img);
+      grid.appendChild(it);
+    }
+    list.appendChild(d);
+  }
+}
+
+async function create(){
+  const name = $('#kw').value.trim();
+  if (!name) { fail('请先输入关键词'); return; }
+  await act({action: 'create', name});
+  $('#kw').value = '';
+  await load();
+}
+
+const readB64 = f => new Promise((ok, err) => {
+  const r = new FileReader();
+  r.onload  = () => ok(String(r.result).split(',', 2)[1]);  // 去掉 dataURL 前缀
+  r.onerror = err;
+  r.readAsDataURL(f);
+});
+
+async function upload(name, files){
+  if (!files || !files.length) return;
+  // ponytail: 走 JSON+base64（多文件、跨新旧 Web 层一条代码路径）；超大图再改 bridge.upload 逐张 multipart
+  const payload = {files: []};
+  for (const f of files) payload.files.push({name: f.name, data: await readB64(f)});
+  await act({action: 'upload', name, files: payload.files});
+  await load();
+}
+
+// 沙箱内 confirm 不可用：两次点击确认（第一次点变橙色“确认删除?”，再点执行）
+function armed(btn, text){
+  if (btn.dataset.arm) return true;
+  btn.dataset.arm = '1';
+  btn.classList.add('arm');
+  btn.dataset.old = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.dataset.arm = ''; btn.classList.remove('arm'); btn.textContent = btn.dataset.old; }, 3000);
+  return false;
+}
+
+async function delI(name, image, btn){
+  if (!armed(btn, '确认删除?')) return;
+  await act({action: 'delete_image', name, image});
+  await load();
+}
+
+async function delG(name, btn){
+  if (!armed(btn, '确认删除图库?')) return;
+  await act({action: 'delete', name});
+  await load();
+}
+
+// ---------- 批量导入 ----------
+
+function insertBlock(text){
+  const el = $('#pattern');
+  const s = el.selectionStart ?? el.value.length;
+  const e = el.selectionEnd ?? s;
+  el.value = el.value.slice(0, s) + text + el.value.slice(e);
+  el.focus();
+  el.setSelectionRange(s + text.length, s + text.length);
+}
+function setPattern(p){ $('#pattern').value = p; }
+
+async function doImport(){
+  const out = $('#import-result');
+  const pattern = $('#pattern').value.trim();
+  const files = Array.from($('#import-files').files || []);
+  if (!pattern.includes('{图库名}')) { out.innerHTML = '<p class="err">格式里必须包含 {图库名}</p>'; return; }
+  if (!files.length) { out.innerHTML = '<p class="err">请先选择要导入的图片</p>'; return; }
+
+  // 分批：每批 ≤6 张且合计 ≤20MB，避免单个请求过大
+  const batches = [];
+  let cur = [], size = 0;
+  for (const f of files) {
+    if (cur.length && (cur.length >= 6 || size + f.size > 20 * 1024 * 1024)) { batches.push(cur); cur = []; size = 0; }
+    cur.push(f); size += f.size;
+  }
+  if (cur.length) batches.push(cur);
+
+  const imported = [], skipped = [];
+  const t0 = Date.now();
+  let done = 0;
+  out.innerHTML = `<p>正在导入 0/${files.length} …</p>`;
+  for (const batch of batches) {
+    const payload = [];
+    for (const f of batch) payload.push({name: f.name, data: await readB64(f)});
+    const res = await act({action: 'import', pattern, files: payload});
+    imported.push(...(pick(res, 'imported') || []));
+    skipped.push(...(pick(res, 'skipped') || []));
+    done += batch.length;
+    // ponytail: 按已处理张数估算速度/剩余，首批含读取开销、早期数字会偏慢属正常
+    const sec = Math.max((Date.now() - t0) / 1000, 0.001);
+    const rate = done / sec;
+    const left = files.length - done;
+    const eta = left ? `，预计剩余 ${fmtSec(left / rate)}` : '';
+    out.innerHTML = `<p>正在导入 ${done}/${files.length} …（${rate.toFixed(1)} 张/秒${eta}）</p>`;
+  }
+
+  renderResult(imported, skipped, files.length, (Date.now() - t0) / 1000);
+  $('#import-files').value = '';
+}
+
+const fmtSec = s => s >= 60 ? `${Math.floor(s / 60)} 分 ${Math.round(s % 60)} 秒` : `${s.toFixed(1)} 秒`;
+
+// 导入成果：按图库分组、带缩略图与 pid；跳过项折叠展示
+const PREVIEW_MAX = 60;  // ponytail: 每库最多预览 60 张，避免一次导入几百张时狂发请求
+function resultItem(gallery, file, pid){
+  const it = document.createElement('div');
+  it.className = 'item';
+  it.innerHTML = `<div class="pid" title="${esc(file)}">${esc(file)}${pid ? '<br>PID:' + esc(pid) : ''}</div>`;
+  const img = document.createElement('img');
+  act({action: 'raw', name: gallery, image: file})
+    .then(p => { const src = pick(p, 'data'); if (src) img.src = src; })
+    .catch(() => {});
+  it.prepend(img);
+  return it;
+}
+
+function renderResult(imported, skipped, total, elapsed){
+  const out = $('#import-result');
+  out.textContent = '';
+  const card = document.createElement('div');
+  card.className = 'g';
+  const spent = elapsed ? ` ／ 耗时 ${fmtSec(elapsed)}（${(total / Math.max(elapsed, 0.001)).toFixed(1)} 张/秒）` : '';
+  card.innerHTML = `<h3><span>导入成果</span>
+    <small>成功 ${imported.length} 张 ／ 跳过 ${skipped.length} 张 ／ 共 ${total} 张${spent}</small></h3>`;
+
+  const groups = new Map();
+  for (const it of imported) {
+    if (!groups.has(it.gallery)) groups.set(it.gallery, []);
+    groups.get(it.gallery).push(it);
+  }
+  if (!groups.size) {
+    card.insertAdjacentHTML('beforeend', '<p class="err">没有图片被导入：请检查文件名与设定格式是否一致。</p>');
+  }
+  for (const [g, items] of groups) {
+    card.insertAdjacentHTML('beforeend',
+      `<h3><span>${esc(g)}</span> <small>${items.length} 张</small></h3>`);
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    for (const it of items.slice(0, PREVIEW_MAX)) grid.appendChild(resultItem(g, it.file, it.pid));
+    card.appendChild(grid);
+    if (items.length > PREVIEW_MAX) {
+      card.insertAdjacentHTML('beforeend', `<div class="hint">仅预览前 ${PREVIEW_MAX} 张，其余已入库。</div>`);
+    }
+  }
+  if (skipped.length) {
+    const d = document.createElement('details');
+    d.innerHTML = `<summary>跳过明细（${skipped.length}）</summary><ul>${
+      skipped.map(s => `<li>${esc(s.name)} — ${esc(s.reason)}</li>`).join('')}</ul>`;
+    card.appendChild(d);
+  }
+  out.appendChild(card);
+}
+
+whenBridge()
+  .then(async b => { B = b; if (B.ready) await Promise.race([B.ready(), new Promise(r => setTimeout(r, 5000))]); await load(); })
+  .catch(fail);
+</script>
+</body>
+</html>
