@@ -42,6 +42,7 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
   <span>图库plus <small>关键词图库管理</small></span>
   <span class="spacer"></span>
   <button id="btn-import" onclick="run(showImport)">批量导入</button>
+  <button id="btn-wm" onclick="run(showWm)">水印设置</button>
   <button id="btn-back" onclick="run(showMain)" hidden>返回图库列表</button>
 </h2>
 
@@ -104,6 +105,27 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
   </div>
 </div>
 
+<!-- 水印设置 -->
+<div id="view-wm" hidden>
+  <div class="g">
+    <h3>水印字体</h3>
+    <div class="bar">
+      <label>中文字体 <select id="wm-cjk"></select></label>
+      <label>西文/数字字体 <select id="wm-latin"></select></label>
+      <button onclick="run(saveWm)">保存</button>
+      <label class="up">＋上传字体文件<input type="file" id="wm-font-file" accept=".ttf,.ttc,.otf" hidden></label>
+    </div>
+    <div class="hint">
+      默认黑体；中文字体管信息条里的汉字，西文/数字字体管文件名后缀、PID 等。
+      字体可选系统已安装的，也可点「上传字体文件」把 .ttf/.ttc/.otf 文件放进插件字体池（如
+      <code>OPPO Sans</code>（中文，[官方下载](https://open.oppomobile.com/new/developmentDoc/info?id=13223)，免费商用）与
+      <code>Reo Sans Light</code>（西文/数字，商业字体，请自行购买授权），装好或传好后在这里选择即可。
+      设置保存后对之后生成的信息条生效。
+    </div>
+    <div id="wm-result"></div>
+  </div>
+</div>
+
 <script>
 "use strict";
 // 受限 iframe 里 alert/confirm 会被静默吞掉，所有反馈一律渲染进页面
@@ -149,8 +171,10 @@ function showMain(){
   S.gal = null;
   $('#view-gallery').hidden = true;
   $('#view-import').hidden = true;
+  $('#view-wm').hidden = true;
   $('#view-main').hidden = false;
   $('#btn-import').hidden = false;
+  $('#btn-wm').hidden = false;
   $('#btn-back').hidden = true;
   $('#import-result').innerHTML = '';
   run(() => loadGalleries(true));
@@ -159,9 +183,50 @@ function showImport(){
   $('#view-main').hidden = true;
   $('#view-import').hidden = false;
   $('#btn-import').hidden = true;
+  $('#btn-wm').hidden = true;
   $('#btn-back').hidden = false;
   $('#import-result').innerHTML = '';
 }
+
+// ---------- 水印设置 ----------
+
+function showWm(){
+  $('#view-main').hidden = true;
+  $('#view-import').hidden = true;
+  $('#view-gallery').hidden = true;
+  $('#view-wm').hidden = false;
+  $('#btn-import').hidden = true;
+  $('#btn-wm').hidden = true;
+  $('#btn-back').hidden = false;
+  $('#import-result').innerHTML = '';
+  run(loadWm);
+}
+async function loadWm(){
+  const res = await act({action:'get_settings'});
+  const fonts = pick(res, 'fonts') || {};
+  const avail = pick(res, 'available') || [];
+  for (const [sel, key] of [['#wm-cjk','cjk'], ['#wm-latin','latin']]) {
+    const cur = String(fonts[key] || '').toLowerCase();
+    const el = $(sel);
+    el.innerHTML = avail.map(n =>
+      `<option value="${esc(n)}"${n.toLowerCase() === cur ? ' selected' : ''}>${esc(n)}</option>`).join('');
+    // 当前设置的字体已被卸载时补一项，避免保存时静默丢设置
+    if (cur && ![...el.options].some(o => o.value.toLowerCase() === cur))
+      el.insertAdjacentHTML('afterbegin', `<option value="${esc(fonts[key])}" selected>${esc(fonts[key])}（未安装）</option>`);
+  }
+}
+async function saveWm(){
+  await act({action:'save_settings', cjk: $('#wm-cjk').value, latin: $('#wm-latin').value});
+  $('#wm-result').innerHTML = '<p class="hint">已保存，对之后生成的信息条生效。</p>';
+}
+$('#wm-font-file').onchange = e => run(async () => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  await act({action:'upload_font', name: f.name, data: await readB64(f)});
+  await loadWm();  // 刷新两个下拉，把新字体列进去
+  $('#wm-result').innerHTML = `<p class="hint">字体 ${esc(f.name)} 已上传，记得选中并保存。</p>`;
+});
 
 // ---------- 缩略图：进视口才请求（thumb 失败退回 raw 原图） ----------
 
@@ -234,8 +299,10 @@ async function openGallery(name){
   $('#gal-title').textContent = name;
   $('#view-main').hidden = true;
   $('#view-import').hidden = true;
+  $('#view-wm').hidden = true;
   $('#view-gallery').hidden = false;
   $('#btn-import').hidden = true;
+  $('#btn-wm').hidden = true;
   $('#btn-back').hidden = false;
   scrollTo(0, 0);
   await loadImages(true);

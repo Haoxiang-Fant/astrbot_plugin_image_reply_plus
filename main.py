@@ -4,8 +4,10 @@
 - 一个关键词一个文件夹，消息首词命中关键词即随机回一张图
 - 上传时识别 pixiv 命名（纯数字 / 数字_p数字）并记录 pid 到 pids.json
 - 文件统一重命名为 关键词-编号.扩展名
-- 发送时可选择在图片下方附加 文件名/PID 信息条（水印），仅发送环节，不改原图
+- 发送时可选择在图片下方附加信息条（水印）：主色方块 + 文件名/PID + pixiv 二维码，
+  仅发送环节生成，几何按条高占比缩放，任何图片尺寸视觉一致；中/西文字体可在 WebUI 分别设置
 - WebUI 为 AstrBot 插件 Pages（仪表盘内管理页），后端 API 经 context.register_web_api 注册
+- 二维码生成内嵌 segno（BSD-3-Clause，https://github.com/heuer/segno，见 _segno/LICENSE）
 - 全部数据按 AstrBot 规范存放在 data/plugin_data/astrbot_plugin_image_reply_plus/
 
 参考插件：https://github.com/cumany/astrbot_plugin_image_replay
@@ -20,6 +22,7 @@ import os
 import random
 import re
 import shutil
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -103,16 +106,43 @@ MIME = {
     ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
 }
 FONT_CANDIDATES = (
-    "msyh.ttc", "simhei.ttf", "simsun.ttc",
+    "simhei.ttf", "msyh.ttc", "simsun.ttc",
     "notosanscjk-regular.ttc", "notosanssc-regular.otf", "wqy-microhei.ttc", "pingfang.ttc",
 )
+DEFAULT_CJK_FONT = "simhei.ttf"   # 默认黑体（WebUI 可改）
+DEFAULT_LATIN_FONT = "simhei.ttf"
+FONT_DIRS = [
+    Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+    Path("/usr/share/fonts"),
+    Path("/usr/local/share/fonts"),
+    Path("/System/Library/Fonts"),
+    Path("/System/Library/Fonts/Supplemental"),
+]
+
+# 水印条设计常量：均为"占信息条高度的占比"，来自参考样图逐像素测量。
+# 条高 = 图片高 × WM_BAR_FRAC，任何尺寸的图输出视觉比例一致。
+WM_BAR_FRAC = 0.08
+WM_BG = (246, 244, 236)      # 条底色（米白）
+WM_FG = (0, 0, 0)            # 文字/二维码
+WM_SQUARE = 0.49             # 主色方块边长
+WM_SQUARE_X = 0.303          # 方块左边距
+WM_TEXT_X = 0.942            # 文字左边距
+WM_TEXT1_SIZE = 0.2656       # 第一行（文件名）字号
+WM_TEXT2_SIZE = 0.2199       # 第二行（PID 行）字号
+WM_TEXT_LINE_GAP = 0.361     # 两行墨迹顶部的间距
+WM_QR_SIZE = 0.71            # 二维码边长
+WM_QR_RIGHT = 0.361          # 二维码右边距
+WM_QR_URL = "https://www.pixiv.net/artworks/{pid}"
+WM_FALLBACK_COLOR = (103, 141, 134)  # 样图占位主色，提取不到饱和主色时兜底
+# 中日韩字符段（含全角标点/全角字母）→ 用中文字体绘制，其余交给西文字体
+CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]+")
 
 
 @register(
     PLUGIN_NAME,
     "cuman",
     "图库plus：关键词图库，一关键词一文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印。",
-    "0.1.1",
+    "0.1.2",
     "https://github.com/cumany/astrbot_plugin_image_replay",
 )
 class GalleryPlus(Star):
@@ -127,9 +157,13 @@ class GalleryPlus(Star):
         self._galleries = root / "galleries"  # 每个关键词一个文件夹
         self._pid_file = root / "pids.json"   # {"关键词/文件名": "pid"}
         self._tmp = root / "temp"             # 发送用水印临时文件
+        self._settings_file = root / "settings.json"  # 水印字体等 WebUI 设置
+        self._fonts_dir = root / "fonts"      # 管理员上传的字体文件池
         self._galleries.mkdir(parents=True, exist_ok=True)
         self._tmp.mkdir(parents=True, exist_ok=True)
+        self._fonts_dir.mkdir(parents=True, exist_ok=True)
         self._pids: Dict[str, str] = self._load_pids()
+        self._settings: Dict[str, str] = self._load_settings()
         self._register_page_apis()
 
     # ---------------- 消息响应 ----------------
@@ -348,8 +382,129 @@ class GalleryPlus(Star):
 
     # ---------------- 水印 ----------------
 
+    def _load_settings(self) -> Dict[str, str]:
+        try:
+            data = json.loads(self._settings_file.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings(self) -> None:
+        self._settings_file.write_text(
+            json.dumps(self._settings, ensure_ascii=False, indent=2), "utf-8"
+        )
+
+    def _wm_fonts(self, size: int):
+        """按设置取 (中文字体, 西文字体)，各自带回退链（含管理员上传池）。"""
+        d = str(self._fonts_dir)
+        return (
+            _resolve_font(self._settings.get("wm_font_cjk") or DEFAULT_CJK_FONT, size, d),
+            _resolve_font(self._settings.get("wm_font_latin") or DEFAULT_LATIN_FONT, size, d),
+        )
+
+    @staticmethod
+    def _theme_color(im):
+        """图片主色：量化聚类后取 数量×饱和度 最高的中间调簇，压暗成样图那种低饱和调。"""
+        try:
+            t = im.convert("RGB").resize((120, 120))
+            q = t.quantize(16).convert("RGB")
+            cnt = Counter(q.get_flattened_data() if hasattr(q, "get_flattened_data") else q.getdata())
+            sat = lambda c: max(c) - min(c)  # noqa: E731
+            cands = [
+                (c, n) for c, n in cnt.items()
+                if sat(c) >= 25 and not (max(c) > 217 and sat(c) < 60)  # 排除过亮的近中性色（地板/留白）
+            ]
+            if not cands:
+                return WM_FALLBACK_COLOR
+            c, _ = max(cands, key=lambda cn: cn[1] * sat(cn[0]))
+            return tuple(int(v * 0.75) for v in c)
+        except Exception:
+            return WM_FALLBACK_COLOR
+
+    @staticmethod
+    def _load_segno():
+        """按文件位置加载内嵌 segno（不依赖插件目录在 sys.path，也不与 pip 版冲突）。"""
+        import importlib.util
+        import sys
+
+        if "_segno" in sys.modules:
+            return sys.modules["_segno"]
+        init = Path(__file__).parent / "_segno" / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            "_segno", init, submodule_search_locations=[str(init.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["_segno"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _qr_image(pid: str, px: int):
+        """pixiv 作品页二维码（内嵌 segno，BSD-3-Clause，见 _segno/LICENSE）。
+
+        pid 形如 95026140_p3 时取数字主体作 URL；生成失败返回 None（信息条照常，无码）。
+        """
+        from PIL import Image, ImageDraw
+
+        try:
+            segno = GalleryPlus._load_segno()
+
+            m = re.match(r"\d+", pid)
+            qr = segno.make_qr(WM_QR_URL.format(pid=m.group() if m else pid), error="m")
+            matrix = qr.matrix
+            n = len(matrix)
+            s = 8  # 先放大渲染再 NEAREST 收缩到目标像素，避免模块缝隙
+            img = Image.new("L", (n * s, n * s), 255)
+            d = ImageDraw.Draw(img)
+            for y, row in enumerate(matrix):
+                for x, v in enumerate(row):
+                    if v:
+                        d.rectangle((x * s, y * s, (x + 1) * s - 1, (y + 1) * s - 1), fill=0)
+            return img.resize((px, px), Image.NEAREST)
+        except Exception as e:
+            logger.warning(f"二维码生成失败（信息条不含码）: {e}")
+            return None
+
+    @staticmethod
+    def _script_runs(text: str):
+        """按 中日韩/西文 切分文字，各自选用字体。返回 [(片段, 是否CJK)]。"""
+        runs, i = [], 0
+        for m in CJK_RUN_RE.finditer(text):
+            if m.start() > i:
+                runs.append((text[i : m.start()], False))
+            runs.append((m.group(), True))
+            i = m.end()
+        if i < len(text):
+            runs.append((text[i:], False))
+        return runs or [(text, False)]
+
+    @staticmethod
+    def _line_image(text: str, size: int, f_cjk, f_lat, color=WM_FG):
+        """把一行混排文字渲染成透明条带图（墨迹紧贴边缘，便于按墨迹顶部定位）。"""
+        from PIL import Image, ImageDraw
+
+        fonts = []
+        for run, is_cjk in GalleryPlus._script_runs(text):
+            f = f_cjk if is_cjk else f_lat
+            if f not in fonts:
+                fonts.append(f)
+        asc = max(f.getmetrics()[0] for f in fonts)
+        desc = max(f.getmetrics()[1] for f in fonts)
+        img = Image.new("RGBA", (int(size * len(text) * 1.6) + 8, asc + desc + 8), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        x = 4.0
+        for run, is_cjk in GalleryPlus._script_runs(text):
+            f = f_cjk if is_cjk else f_lat
+            d.text((x, asc), run, font=f, fill=color + (255,), anchor="ls")
+            x += d.textlength(run, font=f)
+        bb = img.getbbox()
+        return img.crop(bb) if bb else img
+
     def _render_watermark(self, path: Path) -> Path:
-        """图片下方拼一条深色信息条：文件名 + PID。动图不动（避免只发第一帧）。"""
+        """发送时在图片下方拼信息条：主色方块 + 文件名/PID + pixiv 二维码。
+
+        几何全部按条高占比换算（条高=图高×8%），任何尺寸视觉一致；动图跳过。
+        """
         if path.suffix.lower() == ".gif":
             return path
         try:
@@ -358,20 +513,40 @@ class GalleryPlus(Star):
             return path
         try:
             pid = self._pids.get(f"{path.parent.name}/{path.name}")
-            text = path.name + (f"   PID:{pid}" if pid else "")
-            font = _cjk_font(24)
             im = Image.open(path).convert("RGB")
             w, h = im.size
-            probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-            left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
-            strip = (bottom - top) + 16
-            canvas = Image.new("RGB", (w, h + strip), (18, 18, 18))
+            b = max(round(h * WM_BAR_FRAC), 1)
+            canvas = Image.new("RGB", (w, h + b), WM_BG)
             canvas.paste(im, (0, 0))
-            ImageDraw.Draw(canvas).text(
-                ((w - (right - left)) // 2, h + 8 - top),
-                text, fill=(235, 235, 235), font=font,
+            d = ImageDraw.Draw(canvas)
+            top = h  # 信息条 y 原点 = 原图底边
+            # 主色方块（垂直居中）
+            sq = round(b * WM_SQUARE)
+            d.rectangle(
+                (round(b * WM_SQUARE_X), top + (b - sq) // 2,
+                 round(b * WM_SQUARE_X) + sq - 1, top + (b - sq) // 2 + sq - 1),
+                fill=self._theme_color(im),
             )
-            # 输出格式可配置：jpg 体积小（默认），png 无损
+            # 两行文字（中/西文字体可分设；行宽超出可用空间时逐级缩字号）
+            qr_px = round(b * WM_QR_SIZE)
+            qr_right = round(b * WM_QR_RIGHT)
+            max_text_w = w - round(b * WM_TEXT_X) - (qr_px + qr_right + round(b * 0.2) if pid else round(b * 0.3))
+            line1 = self._fit_line(path.name, round(b * WM_TEXT1_SIZE), max_text_w)
+            line2_text = f"PID {pid}" if pid else "暂无 PID信息"
+            line2 = self._fit_line(line2_text, round(b * WM_TEXT2_SIZE), max_text_w)
+            # 两行作为一整块垂直居中（gap 是两行墨迹顶部的距离，块高 = gap + 第二行高）
+            gap = round(b * WM_TEXT_LINE_GAP)
+            t_top = (b - (gap + line2.height)) // 2
+            canvas.paste(line1, (round(b * WM_TEXT_X), top + t_top), line1)
+            canvas.paste(line2, (round(b * WM_TEXT_X), top + t_top + gap), line2)
+            # 二维码（有 pid 才画，垂直居中）
+            if pid:
+                qr = self._qr_image(pid, qr_px)
+                if qr is not None:
+                    canvas.paste(
+                        qr,
+                        (w - qr_px - qr_right, top + (b - qr_px) // 2),
+                    )
             fmt = "png" if str(self.config.get("output_format", "jpg")).lower() == "png" else "jpg"
             out = self._tmp / f"{path.parent.name}_{path.stem}.wm.{fmt}"
             if fmt == "png":
@@ -382,6 +557,16 @@ class GalleryPlus(Star):
         except Exception as e:
             logger.warning(f"水印生成失败，发送原图: {e}")
             return path
+
+    def _fit_line(self, text: str, size: int, max_w: int):
+        """渲染一行文字；超宽时缩小字号重渲（最长以可用宽度为限）。"""
+        f_cjk, f_lat = self._wm_fonts(size)
+        img = self._line_image(text, size, f_cjk, f_lat)
+        while img.width > max_w and size > 8:
+            size -= 2
+            f_cjk, f_lat = self._wm_fonts(size)
+            img = self._line_image(text, size, f_cjk, f_lat)
+        return img
 
     # ---------------- WebUI（AstrBot 插件 Pages 后端）----------------
 
@@ -560,31 +745,97 @@ class GalleryPlus(Star):
                 return error_response("文件名格式必须包含 {图库名}")
             return json_response(self.import_files(pattern, payload.get("files", [])))
 
+        if action == "get_settings":  # 水印设置：当前字体 + 可用字体列表（系统 + 上传池）
+            return json_response(
+                {
+                    "fonts": {
+                        "cjk": self._settings.get("wm_font_cjk") or DEFAULT_CJK_FONT,
+                        "latin": self._settings.get("wm_font_latin") or DEFAULT_LATIN_FONT,
+                    },
+                    "available": sorted(_font_index(str(self._fonts_dir))),
+                }
+            )
+
+        if action == "save_settings":  # 保存水印字体设置（名称必须是可用的字体文件）
+            idx = _font_index(str(self._fonts_dir))
+            for key, default in (("cjk", DEFAULT_CJK_FONT), ("latin", DEFAULT_LATIN_FONT)):
+                name = str(payload.get(key, "")).strip()
+                if name and name.lower() not in idx:
+                    return error_response(f"系统中未找到字体文件: {name}", status_code=400)
+                self._settings[f"wm_font_{key}"] = name or default
+            self._save_settings()
+            return json_response({"ok": True})
+
+        if action == "upload_font":  # 管理员上传字体文件进字体池，之后可在下拉里选
+            fname = Path(str(payload.get("name", ""))).name  # 只取文件名，防路径穿越
+            if fname.lower().rsplit(".", 1)[-1] not in ("ttf", "ttc", "otf"):
+                return error_response("仅支持 .ttf/.ttc/.otf 字体文件", status_code=400)
+            b64 = str(payload.get("data", ""))
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return error_response("内容解码失败", status_code=400)
+            if not data or len(data) > 30 * 1024 * 1024:
+                return error_response("字体文件为空或超过 30MB", status_code=400)
+            target = self._fonts_dir / fname
+            target.write_bytes(data)
+            try:  # 信任边界：必须真的是 PIL 能加载的字体才收下
+                from PIL import ImageFont
+
+                ImageFont.truetype(str(target), 16)
+            except Exception:
+                target.unlink(missing_ok=True)
+                return error_response("不是有效的字体文件", status_code=400)
+            _font_index.cache_clear()  # 新字体进入索引
+            return json_response({"ok": True, "name": fname})
+
         return error_response("未知操作", status_code=400)
 
 
 @lru_cache(maxsize=None)
-def _cjk_font(size: int):
-    """找一个能画中文的字体；找不到就退回 PIL 默认字体。"""
+def _font_index(extra_dir: str = "") -> Dict[str, str]:
+    """字体索引：小写文件名 → 完整路径。
+
+    系统字体目录 + extra_dir（管理员上传池，同名覆盖系统字体）。
+    """
+    out: Dict[str, str] = {}
+    dirs = [Path(p) for p in FONT_DIRS]
+    if extra_dir:
+        dirs.append(Path(extra_dir))
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        try:
+            for p in d.rglob("*"):
+                if p.suffix.lower() in (".ttf", ".ttc", ".otf"):
+                    out[p.name.lower()] = str(p)  # 后扫描的目录覆盖前者（上传池优先）
+        except OSError:
+            continue
+    return out
+
+
+@lru_cache(maxsize=None)
+def _font_cached(path: str, size: int):
     from PIL import ImageFont
 
-    dirs = [
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
-        Path("/usr/share/fonts"),
-        Path("/usr/local/share/fonts"),
-        Path("/System/Library/Fonts"),
-        Path("/System/Library/Fonts/Supplemental"),
-    ]
-    fonts: List[Path] = []
-    for d in dirs:
-        if d.is_dir():
-            fonts += [p for p in d.rglob("*") if p.suffix.lower() in (".ttf", ".ttc", ".otf")]
-    for want in FONT_CANDIDATES:
-        for p in fonts:
-            if p.name.lower() == want:
-                return ImageFont.truetype(str(p), size)
-    if fonts:
-        return ImageFont.truetype(str(fonts[0]), size)
+    return ImageFont.truetype(path, size)
+
+
+def _resolve_font(name: str, size: int, extra_dir: str = ""):
+    """按设置名解析字体；缺文件时沿回退链找到第一个可用的，最终退回 PIL 默认。"""
+    from PIL import ImageFont
+
+    idx = _font_index(extra_dir)
+    chain = [name.lower(), *FONT_CANDIDATES]
+    for n in chain:
+        p = idx.get(n)
+        if p:
+            try:
+                return _font_cached(p, size)
+            except Exception:
+                continue
     try:
         return ImageFont.load_default(size)
     except TypeError:
