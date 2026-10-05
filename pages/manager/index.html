@@ -5,54 +5,72 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>图库plus</title>
 <style>
-/* 跟随 AstrBot 亮暗主题（bridge 会在 <html> 上维护 data-theme） */
-:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456}
-[data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab}
+/* 跟随 AstrBot 亮暗主题（bridge 会在 <html> 上维护 data-theme）；一律直角 UI */
+:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456;--err:#c0392b;--warn:#e67e22}
+[data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab;--err:#e74c3c;--warn:#e67e22}
 body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:960px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
 h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 h2 small{color:var(--sub);font-weight:normal;font-size:13px}
+h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
 .spacer{flex:1}
 .bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
-input,button{padding:8px 12px;border-radius:6px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
+input,button{padding:8px 12px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
 button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
-label.up{cursor:pointer;color:var(--fg);background:var(--ctrl);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-size:14px}
+label.up{cursor:pointer;color:var(--fg);background:var(--ctrl);border:1px solid var(--line);padding:8px 12px;font-size:14px}
 label.up:hover{background:var(--ctrl-hover)}
-.g{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:12px;margin-bottom:16px}
-.g h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.g{border:1px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px}
+.gal{cursor:pointer}.gal:hover{border-color:var(--sub)}
 .grid{display:flex;flex-wrap:wrap;gap:10px}
 .item{position:relative}
-.item img{width:120px;height:120px;object-fit:cover;border-radius:6px;display:block;background:#000}
-.item .x{position:absolute;top:2px;right:2px;background:#c0392b;border:none;color:#fff;border-radius:4px;padding:1px 7px;cursor:pointer}
-.item .x.arm{background:#e67e22}
+.item img{width:120px;height:120px;object-fit:cover;display:block;background:#000}
+.item img.bad{background:var(--panel);border:1px dashed var(--line);color:var(--err);font-size:11px;padding:4px;object-fit:contain}
+.item .x{position:absolute;top:0;right:0;background:var(--err);border:none;color:#fff;padding:1px 7px;cursor:pointer}
+.item .x.arm{background:var(--warn)}
 .item .pid{font-size:11px;color:var(--pid);margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.err{color:#e74c3c;white-space:pre-wrap;word-break:break-all}
+.err{color:var(--err);white-space:pre-wrap;word-break:break-all}
 .hint{color:var(--sub);font-size:13px;margin:6px 0 10px;line-height:1.7}
-code{background:var(--ctrl);border:1px solid var(--line);border-radius:4px;padding:1px 5px;font-family:ui-monospace,Consolas,monospace}
+code{background:var(--ctrl);border:1px solid var(--line);padding:1px 5px;font-family:ui-monospace,Consolas,monospace}
 #pattern{width:100%;font-family:ui-monospace,Consolas,monospace}
-#import-result p{margin:8px 0}
+.sentinel{height:1px}
 #import-result ul{margin:6px 0;padding-left:20px}
-#import-result .g h3{margin:14px 0 8px}
-#import-result .g h3:first-child{margin-top:0}
-#import-result details{margin-top:12px}
 small{color:var(--sub)}
+summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
 </style>
 </head>
 <body>
 <h2>
   <span>图库plus <small>关键词图库管理</small></span>
   <span class="spacer"></span>
-  <button id="btn-import" onclick="showImport()">批量导入</button>
-  <button id="btn-back" onclick="showMain()" hidden>返回图库</button>
+  <button id="btn-import" onclick="run(showImport)">批量导入</button>
+  <button id="btn-back" onclick="run(showMain)" hidden>返回图库列表</button>
 </h2>
 
+<!-- 一级：图库列表（分页 20/页，默认折叠，点击进入二级） -->
 <div id="view-main">
   <div class="bar">
     <input id="kw" placeholder="新关键词，如：可琳照片">
     <button onclick="run(create)">创建关键词</button>
   </div>
   <div id="list">加载中…</div>
+  <div id="sentinel-g" class="sentinel"></div>
+  <button id="more-g" onclick="run(loadGalleries)" hidden>加载更多</button>
 </div>
 
+<!-- 二级：单个图库（分页 50/页） -->
+<div id="view-gallery" hidden>
+  <div class="g">
+    <h3><span id="gal-title"></span> <small id="gal-count"></small></h3>
+    <div class="bar">
+      <label class="up">＋上传图片<input type="file" id="gal-up" accept="image/*" multiple hidden></label>
+      <button id="gal-del">删除图库</button>
+    </div>
+    <div id="gimgs" class="grid"></div>
+    <div id="sentinel-i" class="sentinel"></div>
+    <button id="more-i" onclick="run(loadImages)" hidden>加载更多</button>
+  </div>
+</div>
+
+<!-- 批量导入 -->
 <div id="view-import" hidden>
   <div class="g">
     <h3>文件名格式（搭积木）</h3>
@@ -80,7 +98,7 @@ small{color:var(--sub)}
     </div>
     <div class="bar">
       <input type="file" id="import-files" accept="image/*" multiple>
-      <button onclick="run(doImport)">开始导入</button>
+      <button onclick="run(() => doImport(Array.from($('#import-files').files)))">开始导入</button>
     </div>
     <div id="import-result"></div>
   </div>
@@ -125,6 +143,18 @@ async function run(fn){
   try { await fn(); } catch (e) { fail(e); }
 }
 
+// ---------- 视图切换 ----------
+
+function showMain(){
+  S.gal = null;
+  $('#view-gallery').hidden = true;
+  $('#view-import').hidden = true;
+  $('#view-main').hidden = false;
+  $('#btn-import').hidden = false;
+  $('#btn-back').hidden = true;
+  $('#import-result').innerHTML = '';
+  run(() => loadGalleries(true));
+}
 function showImport(){
   $('#view-main').hidden = true;
   $('#view-import').hidden = false;
@@ -132,51 +162,127 @@ function showImport(){
   $('#btn-back').hidden = false;
   $('#import-result').innerHTML = '';
 }
-function showMain(){
+
+// ---------- 缩略图：进视口才请求（thumb 失败退回 raw 原图） ----------
+
+// 后端返回 {src:...}；老版本信封/裸字符串也兼容（bridge 会剥掉顶层 data 键）
+const extractSrc = p => typeof p === 'string' ? p : (p && (p.src ?? p.data)) || null;
+function fetchSrc(gal, file){
+  return act({action:'thumb', name:gal, image:file})
+    .then(p => extractSrc(p))
+    .then(src => src || Promise.reject(new Error('no thumb')))
+    .catch(() => act({action:'raw', name:gal, image:file}).then(p => extractSrc(p)));
+}
+function loadThumb(img){
+  if (img.dataset.done) return;
+  img.dataset.done = '1';
+  fetchSrc(img.dataset.g, img.dataset.f)
+    .then(src => { if (src) img.src = src; else throw new Error('empty'); })
+    .catch(e => { console.error('缩略图加载失败', img.dataset.g, img.dataset.f, e);
+                  img.classList.add('bad'); img.alt = '加载失败'; img.title = img.dataset.f; });
+}
+const io = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(es => {
+      for (const e of es) if (e.isIntersecting){ io.unobserve(e.target); loadThumb(e.target); }
+    }, {rootMargin: '300px'})
+  : null;
+const observeImg = img => io ? io.observe(img) : loadThumb(img);
+
+// ---------- 一级：图库列表（20/页，滑到底自动加载，也有加载按钮） ----------
+
+const S = {off: 0, total: null, busyG: false, gal: null, ioff: 0, itotal: null, busyI: false};
+const inView = el => { const r = el.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; };
+const moreBtn = (sel, text) => { const b = $(sel); b.hidden = !text; if (text) b.textContent = text; };
+
+function galRow(g){
+  const d = document.createElement('div');
+  d.className = 'g gal';
+  d.innerHTML = `<h3><span>${esc(g.name)} <small>${g.count} 张</small></span><span class="ops">
+    <label class="up">＋上传<input type="file" accept="image/*" multiple hidden></label>
+    <button class="del">删除图库</button></span></h3>`;
+  d.onclick = () => run(() => openGallery(g.name));
+  d.querySelector('.ops').onclick = e => e.stopPropagation();
+  d.querySelector('input[type=file]').onchange = e => run(() => upload(g.name, e.target.files, () => loadGalleries(true)));
+  d.querySelector('.del').onclick = e => run(() => delG(g.name, e.target));
+  return d;
+}
+
+async function loadGalleries(reset){
+  if (reset){ S.off = 0; S.total = null; $('#list').innerHTML = ''; $('#list').textContent = '加载中…'; }
+  if (S.busyG || (S.total != null && S.off >= S.total)) return;
+  S.busyG = true;
+  moreBtn('#more-g', '加载中…');
+  try{
+    const res = await act({action:'list_galleries', offset: S.off, limit: 20});
+    const gs = pick(res, 'galleries') || [];
+    S.total = pick(res, 'total');
+    S.off += gs.length;
+    $('#list').innerHTML = '';  // 顺带清掉可能残留的「加载中…」（追加与清空同帧，无闪烁）
+    for (const g of gs) $('#list').appendChild(galRow(g));
+    const done = S.total != null && S.off >= S.total;
+    moreBtn('#more-g', done ? null : '加载更多');
+    if (done && !$('#list').children.length) $('#list').textContent = '暂无关键词，先创建一个。';
+    // 视口没填满就继续补一页，避免卡在半屏（setTimeout 让 finally 先释放 busy 标志）
+    if (!done && inView($('#sentinel-g'))) setTimeout(() => run(loadGalleries), 0);
+  } finally { S.busyG = false; }
+}
+
+// ---------- 二级：图库内图片（50/页） ----------
+
+async function openGallery(name){
+  S.gal = name;
+  $('#gal-title').textContent = name;
+  $('#view-main').hidden = true;
   $('#view-import').hidden = true;
-  $('#view-main').hidden = false;
-  $('#btn-import').hidden = false;
-  $('#btn-back').hidden = true;
-  run(load);
+  $('#view-gallery').hidden = false;
+  $('#btn-import').hidden = true;
+  $('#btn-back').hidden = false;
+  scrollTo(0, 0);
+  await loadImages(true);
 }
 
-// ---------- 图库管理 ----------
-
-async function load(){
-  const body = await apiGet('galleries');
-  const galleries = pick(body, 'galleries') || [];
-  const list = $('#list');
-  list.innerHTML = galleries.length ? '' : '暂无关键词，先创建一个。';
-  for (const g of galleries) {
-    const d = document.createElement('div');
-    d.className = 'g';
-    d.innerHTML = `<h3><span>${esc(g.name)} <small>${g.count} 张</small></span>
-      <span><label class="up">＋上传图片<input type="file" accept="image/*" multiple hidden
-        onchange="run(() => upload('${esc(g.name)}', this.files))"></label>
-      <button onclick="run(() => delG('${esc(g.name)}', this))">删除图库</button></span></h3><div class="grid"></div>`;
-    const grid = d.querySelector('.grid');
-    for (const im of g.images) {
-      const it = document.createElement('div');
-      it.className = 'item';
-      it.innerHTML = `<button class="x" onclick="run(() => delI('${esc(g.name)}','${esc(im.file)}', this))">✕</button>
-        <div class="pid" title="${esc(im.pid || '')}">${im.pid ? 'PID:' + esc(im.pid) : '无PID'}</div>`;
-      const img = document.createElement('img');
-      act({action: 'raw', name: g.name, image: im.file})
-        .then(p => { const src = pick(p, 'data'); if (src) img.src = src; })
-        .catch(() => {});
-      it.prepend(img);
-      grid.appendChild(it);
-    }
-    list.appendChild(d);
-  }
+function imgItem(gal, im){
+  const it = document.createElement('div');
+  it.className = 'item';
+  it.innerHTML = `<button class="x">✕</button>
+    <div class="pid" title="${esc(im.pid || '')}">${im.pid ? 'PID:' + esc(im.pid) : '无PID'}</div>`;
+  it.querySelector('.x').onclick = e => run(() => delI(gal, im.file, e.target));
+  const img = document.createElement('img');
+  img.dataset.g = gal; img.dataset.f = im.file;
+  it.prepend(img);
+  observeImg(img);
+  return it;
 }
+
+async function loadImages(reset){
+  const gal = S.gal;
+  if (!gal) return;
+  if (reset){ S.ioff = 0; S.itotal = null; $('#gimgs').innerHTML = ''; }
+  if (S.busyI || (S.itotal != null && S.ioff >= S.itotal)) return;
+  S.busyI = true;
+  moreBtn('#more-i', '加载中…');
+  try{
+    const res = await act({action:'list_images', name: gal, offset: S.ioff, limit: 50});
+    const imgs = pick(res, 'images') || [];
+    S.itotal = pick(res, 'total');
+    S.ioff += imgs.length;
+    $('#gal-count').textContent = `${S.itotal} 张`;
+    for (const im of imgs) $('#gimgs').appendChild(imgItem(gal, im));
+    const done = S.itotal != null && S.ioff >= S.itotal;
+    moreBtn('#more-i', done ? null : '加载更多');
+    if (done && S.itotal === 0) $('#gimgs').innerHTML = '<p class="hint">图库是空的，上传几张吧。</p>';
+    if (!done && inView($('#sentinel-i'))) setTimeout(() => run(loadImages), 0);
+  } finally { S.busyI = false; }
+}
+
+// ---------- 增删改 ----------
 
 async function create(){
   const name = $('#kw').value.trim();
   if (!name) { fail('请先输入关键词'); return; }
   await act({action: 'create', name});
   $('#kw').value = '';
-  await load();
+  await loadGalleries(true);
 }
 
 const readB64 = f => new Promise((ok, err) => {
@@ -186,13 +292,13 @@ const readB64 = f => new Promise((ok, err) => {
   r.readAsDataURL(f);
 });
 
-async function upload(name, files){
+async function upload(name, files, after){
   if (!files || !files.length) return;
   // ponytail: 走 JSON+base64（多文件、跨新旧 Web 层一条代码路径）；超大图再改 bridge.upload 逐张 multipart
   const payload = {files: []};
   for (const f of files) payload.files.push({name: f.name, data: await readB64(f)});
   await act({action: 'upload', name, files: payload.files});
-  await load();
+  if (after) await after();
 }
 
 // 沙箱内 confirm 不可用：两次点击确认（第一次点变橙色“确认删除?”，再点执行）
@@ -209,14 +315,17 @@ function armed(btn, text){
 async function delI(name, image, btn){
   if (!armed(btn, '确认删除?')) return;
   await act({action: 'delete_image', name, image});
-  await load();
+  await loadImages(true);
 }
 
 async function delG(name, btn){
   if (!armed(btn, '确认删除图库?')) return;
   await act({action: 'delete', name});
-  await load();
+  if (S.gal === name) await showMain();
+  else await loadGalleries(true);
 }
+$('#gal-up').onchange = e => run(() => upload(S.gal, e.target.files, () => loadImages(true)));
+$('#gal-del').onclick = e => run(() => delG(S.gal, e.target));
 
 // ---------- 批量导入 ----------
 
@@ -230,12 +339,16 @@ function insertBlock(text){
 }
 function setPattern(p){ $('#pattern').value = p; }
 
-async function doImport(){
+let lastRun = null, lastSkipped = [];  // 供“重试跳过项”用：文件名 → File 对象
+
+async function doImport(files, title){
   const out = $('#import-result');
   const pattern = $('#pattern').value.trim();
-  const files = Array.from($('#import-files').files || []);
   if (!pattern.includes('{图库名}')) { out.innerHTML = '<p class="err">格式里必须包含 {图库名}</p>'; return; }
-  if (!files.length) { out.innerHTML = '<p class="err">请先选择要导入的图片</p>'; return; }
+  if (!files || !files.length) { out.innerHTML = '<p class="err">请先选择要导入的图片</p>'; return; }
+
+  lastRun = {pattern, fileMap: new Map(files.map(f => [f.name, f]))};
+  lastSkipped = [];
 
   // 分批：每批 ≤6 张且合计 ≤20MB，避免单个请求过大
   const batches = [];
@@ -248,83 +361,110 @@ async function doImport(){
 
   const imported = [], skipped = [];
   const t0 = Date.now();
-  let done = 0;
-  out.innerHTML = `<p>正在导入 0/${files.length} …</p>`;
+
+  // 实时成果卡：进度行 + 按图库分组的网格随批次实时增长 + 跳过明细（结束时填充）
+  out.textContent = '';
+  const card = document.createElement('div');
+  card.className = 'g';
+  card.innerHTML = `<h3><span>${esc(title || '导入成果')}</span><small id="imp-stat">准备中…</small></h3>
+    <div id="imp-groups"></div><div id="imp-skip"></div>`;
+  out.appendChild(card);
+  const groups = new Map();  // 图库名 → {box, grid, cnt, n}
+
   for (const batch of batches) {
     const payload = [];
     for (const f of batch) payload.push({name: f.name, data: await readB64(f)});
     const res = await act({action: 'import', pattern, files: payload});
-    imported.push(...(pick(res, 'imported') || []));
-    skipped.push(...(pick(res, 'skipped') || []));
-    done += batch.length;
-    // ponytail: 按已处理张数估算速度/剩余，首批含读取开销、早期数字会偏慢属正常
+    const got = pick(res, 'imported') || [], skip = pick(res, 'skipped') || [];
+    imported.push(...got);
+    skipped.push(...skip);
+    for (const it of got) liveAppend(groups, it);
+    const done = imported.length + skipped.length;
     const sec = Math.max((Date.now() - t0) / 1000, 0.001);
     const rate = done / sec;
     const left = files.length - done;
-    const eta = left ? `，预计剩余 ${fmtSec(left / rate)}` : '';
-    out.innerHTML = `<p>正在导入 ${done}/${files.length} …（${rate.toFixed(1)} 张/秒${eta}）</p>`;
+    $('#imp-stat').textContent =
+      `已入库 ${imported.length} ／ 跳过 ${skipped.length} ／ 共 ${files.length}` +
+      `（${rate.toFixed(1)} 张/秒${left ? `，预计剩余 ${fmtSec(left / rate)}` : ''}）`;
   }
 
-  renderResult(imported, skipped, files.length, (Date.now() - t0) / 1000);
+  $('#imp-stat').textContent =
+    `成功 ${imported.length} 张 ／ 跳过 ${skipped.length} 张 ／ 共 ${files.length} 张 ／ 耗时 ${fmtSec((Date.now() - t0) / 1000)}`;
+  lastSkipped = skipped;
+  renderSkipped($('#imp-skip'), skipped);
+  if (!imported.length && !$('#imp-groups').children.length)
+    $('#imp-groups').innerHTML = '<p class="err">没有图片被导入：请检查文件名与设定格式是否一致。</p>';
   $('#import-files').value = '';
 }
 
 const fmtSec = s => s >= 60 ? `${Math.floor(s / 60)} 分 ${Math.round(s % 60)} 秒` : `${s.toFixed(1)} 秒`;
 
-// 导入成果：按图库分组、带缩略图与 pid；跳过项折叠展示
+// 每完成一批就把新入库的挂到对应图库分组下（带缩略图，进视口才加载）
 const PREVIEW_MAX = 60;  // ponytail: 每库最多预览 60 张，避免一次导入几百张时狂发请求
-function resultItem(gallery, file, pid){
-  const it = document.createElement('div');
-  it.className = 'item';
-  it.innerHTML = `<div class="pid" title="${esc(file)}">${esc(file)}${pid ? '<br>PID:' + esc(pid) : ''}</div>`;
-  const img = document.createElement('img');
-  act({action: 'raw', name: gallery, image: file})
-    .then(p => { const src = pick(p, 'data'); if (src) img.src = src; })
-    .catch(() => {});
-  it.prepend(img);
-  return it;
-}
-
-function renderResult(imported, skipped, total, elapsed){
-  const out = $('#import-result');
-  out.textContent = '';
-  const card = document.createElement('div');
-  card.className = 'g';
-  const spent = elapsed ? ` ／ 耗时 ${fmtSec(elapsed)}（${(total / Math.max(elapsed, 0.001)).toFixed(1)} 张/秒）` : '';
-  card.innerHTML = `<h3><span>导入成果</span>
-    <small>成功 ${imported.length} 张 ／ 跳过 ${skipped.length} 张 ／ 共 ${total} 张${spent}</small></h3>`;
-
-  const groups = new Map();
-  for (const it of imported) {
-    if (!groups.has(it.gallery)) groups.set(it.gallery, []);
-    groups.get(it.gallery).push(it);
-  }
-  if (!groups.size) {
-    card.insertAdjacentHTML('beforeend', '<p class="err">没有图片被导入：请检查文件名与设定格式是否一致。</p>');
-  }
-  for (const [g, items] of groups) {
-    card.insertAdjacentHTML('beforeend',
-      `<h3><span>${esc(g)}</span> <small>${items.length} 张</small></h3>`);
+function liveAppend(groups, it){
+  let g = groups.get(it.gallery);
+  if (!g) {
+    const box = document.createElement('div');
+    box.innerHTML = `<h3><span>${esc(it.gallery)}</span> <small class="gc">0 张</small></h3>`;
     const grid = document.createElement('div');
     grid.className = 'grid';
-    for (const it of items.slice(0, PREVIEW_MAX)) grid.appendChild(resultItem(g, it.file, it.pid));
-    card.appendChild(grid);
-    if (items.length > PREVIEW_MAX) {
-      card.insertAdjacentHTML('beforeend', `<div class="hint">仅预览前 ${PREVIEW_MAX} 张，其余已入库。</div>`);
-    }
+    box.appendChild(grid);
+    $('#imp-groups').appendChild(box);
+    g = {grid, cnt: box.querySelector('.gc'), n: 0, hinted: false};
+    groups.set(it.gallery, g);
   }
-  if (skipped.length) {
-    const d = document.createElement('details');
-    d.innerHTML = `<summary>跳过明细（${skipped.length}）</summary><ul>${
-      skipped.map(s => `<li>${esc(s.name)} — ${esc(s.reason)}</li>`).join('')}</ul>`;
-    card.appendChild(d);
+  g.n++;
+  g.cnt.textContent = `${g.n} 张`;
+  if (g.n > PREVIEW_MAX) {
+    if (!g.hinted) { g.hinted = true; g.grid.insertAdjacentHTML('afterend', `<div class="hint">仅预览前 ${PREVIEW_MAX} 张，其余已入库。</div>`); }
+    return;
   }
-  out.appendChild(card);
+  const item = document.createElement('div');
+  item.className = 'item';
+  item.innerHTML = `<div class="pid" title="${esc(it.file)}">${esc(it.file)}${it.pid ? '<br>PID:' + esc(it.pid) : ''}</div>`;
+  const img = document.createElement('img');
+  img.dataset.g = it.gallery; img.dataset.f = it.file;
+  item.prepend(img);
+  observeImg(img);
+  g.grid.appendChild(item);
 }
 
+function renderSkipped(box, skipped){
+  box.textContent = '';
+  if (!skipped.length) return;
+  const d = document.createElement('details');
+  d.innerHTML = `<summary>跳过 ${skipped.length} 张（点开查看名单并重试）</summary>
+    <ul>${skipped.map(s => `<li>${esc(s.name)} — ${esc(s.reason)}</li>`).join('')}</ul>
+    <button onclick="run(retrySkipped)">重试这 ${skipped.length} 张</button>
+    <span class="hint"> 重试只导入上方跳过的文件；格式本身不符的会再次被跳过。</span>`;
+  box.appendChild(d);
+}
+
+async function retrySkipped(){
+  if (!lastRun) return;
+  const files = lastSkipped.map(s => lastRun.fileMap.get(s.name)).filter(Boolean);
+  if (!files.length) { fail('没有可重试的文件'); return; }
+  await doImport(files, '重试结果');
+}
+
+// ---------- 启动 ----------
+
 whenBridge()
-  .then(async b => { B = b; if (B.ready) await Promise.race([B.ready(), new Promise(r => setTimeout(r, 5000))]); await load(); })
+  .then(async b => {
+    B = b;
+    if (B.ready) await Promise.race([B.ready(), new Promise(r => setTimeout(r, 5000))]);
+    // 滑到底自动加载（IntersectionObserver）；#more-* 按钮是手动兜底
+    if (io) {
+      io2($('#sentinel-g'), () => run(loadGalleries));
+      io2($('#sentinel-i'), () => run(loadImages));
+    }
+    await loadGalleries(true);
+  })
   .catch(fail);
+
+function io2(el, fn){
+  new IntersectionObserver(es => { if (es.some(e => e.isIntersecting)) fn(); }).observe(el);
+}
 </script>
 </body>
 </html>

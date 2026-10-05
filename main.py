@@ -112,7 +112,7 @@ FONT_CANDIDATES = (
     PLUGIN_NAME,
     "cuman",
     "图库plus：关键词图库，一关键词一文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印。",
-    "0.1.0",
+    "0.1.1",
     "https://github.com/cumany/astrbot_plugin_image_replay",
 )
 class GalleryPlus(Star):
@@ -276,6 +276,7 @@ class GalleryPlus(Star):
         if not p.is_file():
             return False
         p.unlink()
+        (self._tmp / "thumbs" / f"{d.name}_{p.stem}.thumb.jpg").unlink(missing_ok=True)
         self._pids.pop(f"{d.name}/{name}", None)
         self._save_pids()
         return True
@@ -285,6 +286,8 @@ class GalleryPlus(Star):
         if not d or not d.is_dir():
             return False
         shutil.rmtree(d)
+        for t in (self._tmp / "thumbs").glob(f"{d.name}_*.thumb.jpg"):
+            t.unlink(missing_ok=True)
         for key in [k for k in self._pids if k.startswith(f"{d.name}/")]:
             self._pids.pop(key, None)
         self._save_pids()
@@ -309,6 +312,39 @@ class GalleryPlus(Star):
                 }
             )
         return out
+
+    def list_gallery_names(self, offset: int = 0, limit: Optional[int] = None):
+        """分页列出图库（只取名与张数，不列图片），供 WebUI 懒加载。返回 (页数据, 总数)。"""
+        names = sorted(d.name for d in self._galleries.iterdir() if d.is_dir())
+        page = names if limit is None else names[offset : offset + limit]
+        out = []
+        for name in page:
+            d = self._galleries / name
+            out.append(
+                {
+                    "name": name,
+                    "count": sum(
+                        1 for p in d.iterdir()
+                        if p.is_file() and p.suffix.lower() in EXTS
+                    ),
+                }
+            )
+        return out, len(names)
+
+    def list_images(self, kw: str, offset: int = 0, limit: Optional[int] = None):
+        """分页列出某图库的图片（文件名+pid），供 WebUI 懒加载。返回 (页数据, 总数)。"""
+        d = self._kw_dir(kw)
+        if not d or not d.is_dir():
+            return [], 0
+        names = sorted(
+            p.name for p in d.iterdir()
+            if p.is_file() and p.suffix.lower() in EXTS
+        )
+        page = names if limit is None else names[offset : offset + limit]
+        return (
+            [{"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in page],
+            len(names),
+        )
 
     # ---------------- 水印 ----------------
 
@@ -335,14 +371,54 @@ class GalleryPlus(Star):
                 ((w - (right - left)) // 2, h + 8 - top),
                 text, fill=(235, 235, 235), font=font,
             )
-            out = self._tmp / f"{path.parent.name}_{path.stem}.wm.png"
-            canvas.save(out, "PNG")
+            # 输出格式可配置：jpg 体积小（默认），png 无损
+            fmt = "png" if str(self.config.get("output_format", "jpg")).lower() == "png" else "jpg"
+            out = self._tmp / f"{path.parent.name}_{path.stem}.wm.{fmt}"
+            if fmt == "png":
+                canvas.save(out, "PNG")
+            else:
+                canvas.save(out, "JPEG", quality=85)
             return out
         except Exception as e:
             logger.warning(f"水印生成失败，发送原图: {e}")
             return path
 
     # ---------------- WebUI（AstrBot 插件 Pages 后端）----------------
+
+    def _thumb(self, kw: str, image: str) -> Optional[Path]:
+        """生成（带磁盘缓存）240px 小缩略图，返回路径；非法路径或 PIL 失败返回 None。"""
+        d = self._kw_dir(kw)
+        if not d or Path(image).name != image:
+            return None
+        p = d / image
+        if not d.is_dir() or not p.is_file():
+            return None
+        tdir = self._tmp / "thumbs"
+        tdir.mkdir(exist_ok=True)
+        out = tdir / f"{kw}_{p.stem}.thumb.jpg"
+        if out.is_file() and out.stat().st_mtime >= p.stat().st_mtime:
+            return out
+        try:
+            from PIL import Image
+            im = Image.open(p)
+            im.thumbnail((240, 240))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(out, "JPEG", quality=80)
+            return out
+        except Exception:
+            return None  # ponytail: 无 PIL/坏图时前端退回 raw 原图
+
+    @staticmethod
+    def _page(payload: dict):
+        """解析分页参数，越界/非法值一律收敛到安全范围。"""
+        try:
+            off = max(int(payload.get("offset") or 0), 0)
+            lim = min(max(int(payload.get("limit") or 20), 1), 200)
+        except (TypeError, ValueError):
+            off, lim = 0, 20
+        return off, lim
+
 
     def _register_page_apis(self):
         reg = getattr(self.context, "register_web_api", None)
@@ -401,6 +477,28 @@ class GalleryPlus(Star):
         payload = await request.json(default={})
         action = payload.get("action")
 
+        if action == "list_galleries":  # 分页：图库名+张数，不含图片（WebUI 懒加载）
+            off, lim = self._page(payload)
+            page, total = self.list_gallery_names(off, lim)
+            return json_response({"galleries": page, "total": total})
+
+        if action == "list_images":  # 分页：单图库内图片列表
+            kw = str(payload.get("name", ""))
+            if not self._kw_dir(kw):
+                return error_response("关键词不存在或非法", status_code=400)
+            off, lim = self._page(payload)
+            imgs, total = self.list_images(kw, off, lim)
+            return json_response({"images": imgs, "total": total})
+
+        if action == "thumb":  # 小缩略图（服务端生成缓存，避免整图 base64 过桥）
+            t = self._thumb(str(payload.get("name", "")), str(payload.get("image", "")))
+            if t is None:
+                return error_response("缩略图生成失败", status_code=404)
+            b64 = base64.b64encode(t.read_bytes()).decode()
+            # 键名必须是 src：bridge 会把顶层 data 键当信封剥掉（PluginPagePage.vue 的
+            # response.data?.data ?? response.data），用 data 键页面只会收到裸字符串
+            return json_response({"src": f"data:image/jpeg;base64,{b64}"})
+
         if action == "create":
             name = str(payload.get("name", ""))
             if not name.strip():
@@ -453,7 +551,7 @@ class GalleryPlus(Star):
                 return error_response("图片不存在", status_code=404)
             b64 = base64.b64encode(p.read_bytes()).decode()
             return json_response(
-                {"data": f"data:{MIME.get(p.suffix.lower(), 'application/octet-stream')};base64,{b64}"}
+                {"src": f"data:{MIME.get(p.suffix.lower(), 'application/octet-stream')};base64,{b64}"}
             )
 
         if action == "import":
