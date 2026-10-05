@@ -8,5 +8,11 @@
     "description": "发送时在图片下方附加 文件名/PID 信息条（仅发送环节生成，不修改原图，GIF 直接原样发送）。",
     "type": "bool",
     "default": true
+  },
+  "output_format": {
+    "description": "发送图片（含水印信息条）的输出格式：jpg 体积更小（默认），png 无损。GIF 始终原样发送。",
+    "type": "string",
+    "options": ["jpg", "png"],
+    "default": "jpg"
   }
 }

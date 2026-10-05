@@ -177,12 +177,45 @@ res = _act("POST", {"action": "upload", "name": "测试库",
                     "files": [{"name": "95026140_p7.jpg", "data": base64.b64encode(b"img").decode()}]})
 assert res["saved"][0] == {"file": "测试库-1.jpg", "pid": "95026140_p7"}, res
 assert (g._galleries / "测试库" / "测试库-1.jpg").read_bytes() == b"img"
-# raw 预览
+# raw 预览（注意：键名必须是 src，bridge 会剥掉顶层 data 键）
 res = _act("POST", {"action": "raw", "name": "测试库", "image": "测试库-1.jpg"})
-assert res["data"].startswith("data:image/jpeg;base64,"), res
+assert res["src"].startswith("data:image/jpeg;base64,"), res
 # raw 防穿越
 res = _act("POST", {"action": "raw", "name": "测试库", "image": "../x.png"})
 assert res["status"] == "error", res
+# 分页 list_galleries / list_images
+res = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+assert res["total"] == 1 and res["galleries"][0]["name"] == "测试库", res
+assert res["galleries"][0]["count"] == 1 and "images" not in res["galleries"][0], res
+res = _act("POST", {"action": "list_galleries", "offset": 1, "limit": 20})
+assert res["galleries"] == [] and res["total"] == 1, res
+res = _act("POST", {"action": "list_images", "name": "测试库", "offset": 0, "limit": 50})
+assert res["total"] == 1 and res["images"][0]["file"] == "测试库-1.jpg", res
+res = _act("POST", {"action": "list_images", "name": "a/../b", "offset": 0, "limit": 50})
+assert res["status"] == "error", res
+# thumb（有 PIL 时：真图 → 小缩略图 + 磁盘缓存；坏图 → 404）
+try:
+    from PIL import Image as _P  # noqa: F401
+    buf = io.BytesIO()
+    _P.new("RGB", (400, 300), "red").save(buf, "PNG")
+    _act("POST", {"action": "upload", "name": "测试库",
+                  "files": [{"name": "real.png", "data": base64.b64encode(buf.getvalue()).decode()},
+                            {"name": "junk.jpg", "data": base64.b64encode(b"junk").decode()}]})
+    res = _act("POST", {"action": "list_images", "name": "测试库", "offset": 0, "limit": 50})
+    files = {im["file"] for im in res["images"]}
+    real = next(f for f in files if f.endswith(".png"))      # real.png 入库后重命名为 测试库-N.png
+    junk = next(f for f in files if f.endswith(".jpg") and f != "测试库-1.jpg")
+    res = _act("POST", {"action": "thumb", "name": "测试库", "image": real})
+    assert res["src"].startswith("data:image/jpeg;base64,"), res
+    tw, th = _P.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1]))).size
+    assert max(tw, th) <= 240, (tw, th)
+    assert (g._tmp / "thumbs" / f"测试库_{Path(real).stem}.thumb.jpg").is_file()
+    res = _act("POST", {"action": "thumb", "name": "测试库", "image": junk})
+    assert res["status"] == "error", res
+    res = _act("POST", {"action": "thumb", "name": "测试库", "image": "../x.jpg"})
+    assert res["status"] == "error", res
+except ImportError:
+    print("(无 PIL，跳过缩略图检查)")
 # delete_image（连带 pid）
 res = _act("POST", {"action": "delete_image", "name": "测试库", "image": "测试库-1.jpg"})
 assert res["ok"] and "测试库/测试库-1.jpg" not in g._pids, res
@@ -238,7 +271,7 @@ kw = res["imported"][0]["gallery"]
 assert "/" not in kw and "\\" not in kw and ".." not in kw, kw
 assert (g._galleries / kw).is_dir() and (g._galleries / kw / res["imported"][0]["file"]).is_file()
 
-# 8) 水印渲染（本机有 PIL 时）
+# 8) 水印渲染（本机有 PIL 时）：默认/指定输出格式 jpg，可切 png
 try:
     from PIL import Image as PImage
     buf = io.BytesIO()
@@ -247,9 +280,14 @@ try:
     src.write_bytes(buf.getvalue())
     out = g._render_watermark(src)
     assert out.exists() and out != src
+    assert out.suffix == ".jpg", out  # 默认输出 jpg（体积更小）
     w, h = PImage.open(out).size
     assert h > 60, f"信息条未加高: {h}"
-    print(f"水印渲染 OK: {w}x{h}")
+    g.config["output_format"] = "png"
+    out2 = g._render_watermark(src)
+    assert out2.suffix == ".png" and out2.exists(), out2
+    g.config["output_format"] = "jpg"
+    print(f"水印渲染 OK: {w}x{h}（jpg/png 输出均通过）")
 except ImportError:
     print("(无 PIL，跳过水印渲染检查)")
 
