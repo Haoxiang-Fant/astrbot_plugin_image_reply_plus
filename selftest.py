@@ -271,25 +271,100 @@ kw = res["imported"][0]["gallery"]
 assert "/" not in kw and "\\" not in kw and ".." not in kw, kw
 assert (g._galleries / kw).is_dir() and (g._galleries / kw / res["imported"][0]["file"]).is_file()
 
-# 8) 水印渲染（本机有 PIL 时）：默认/指定输出格式 jpg，可切 png
+# 8) 水印渲染（本机有 PIL 时）：几何占比、条底色、二维码有/无、输出格式
 try:
     from PIL import Image as PImage
-    buf = io.BytesIO()
-    PImage.new("RGB", (80, 60), "red").save(buf, "PNG")
+
+    def _mkimg(w, h, color="red"):
+        buf = io.BytesIO()
+        PImage.new("RGB", (w, h), color).save(buf, "PNG")
+        return buf.getvalue()
+
     src = _tmp / "t.png"
-    src.write_bytes(buf.getvalue())
+    src.write_bytes(_mkimg(400, 500))
+    g._pids[f"{_tmp.name}/t.png"] = "87775536"  # 播种 pid → 应渲染二维码
     out = g._render_watermark(src)
     assert out.exists() and out != src
     assert out.suffix == ".jpg", out  # 默认输出 jpg（体积更小）
-    w, h = PImage.open(out).size
-    assert h > 60, f"信息条未加高: {h}"
+    im = PImage.open(out).convert("RGB")
+    w, h = im.size
+    assert (w, h) == (400, 540), (w, h)          # 条高 = 500*0.08 = 40
+    b = h - 500
+    assert abs(b / 500 - main.WM_BAR_FRAC) < 0.01, b
+    near = lambda c, want, t=8: all(abs(c[i] - want[i]) <= t for i in range(3))  # jpg 有损
+    assert near(im.getpixel((w // 2, h - 2)), main.WM_BG), "条底色不符"
+    assert near(im.getpixel((w // 2, 10)), (255, 0, 0)), "原图区域被改动"  # 红图未变
+    # 条内内容整体垂直居中（二维码是最高的元素，其中心即条中心）
+    bar = im.crop((0, h - b, w, h)).convert("RGB")
+    bg = main.WM_BG
+    ys = [y for y in range(bar.height)
+          for x in range(0, bar.width, 2)
+          if sum(abs(bar.getpixel((x, y))[i] - bg[i]) for i in range(3)) > 60]
+    assert ys, "信息条里没有内容"
+    assert abs((min(ys) + max(ys)) / 2 - b / 2) <= 2, (min(ys), max(ys), b)
+    # 有 pid → 二维码区域应有暗像素
+    # 有 pid → 信息条右上二维码区域应有暗像素
+    qr_x0 = w - round(b * main.WM_QR_SIZE) - round(b * main.WM_QR_RIGHT) - 2
+    qr_zone = im.crop((qr_x0, h - b, w, h - b + round(b * 0.75)))
+    assert min(qr_zone.convert("L").getdata()) < 100, "有 pid 却没有二维码"
+    # 无 pid → 无二维码
+    src2 = _tmp / "nopid.png"
+    src2.write_bytes(_mkimg(400, 500))
+    out2 = g._render_watermark(src2)
+    im2 = PImage.open(out2).convert("RGB")
+    w2, h2 = im2.size
+    b2 = h2 - 500
+    qr_zone2 = im2.crop((w2 - round(b2 * main.WM_QR_SIZE) - round(b2 * main.WM_QR_RIGHT) - 2,
+                         h2 - b2, w2, h2 - b2 + round(b2 * 0.75)))
+    assert min(qr_zone2.convert("L").getdata()) > 200, "无 pid 不应出现二维码"
+    # 主题色：纯红图 → 压暗后的红色调
+    tc = main.GalleryPlus._theme_color(PImage.new("RGB", (60, 60), (255, 0, 0)))
+    assert isinstance(tc, tuple) and len(tc) == 3 and tc[0] > tc[1] and tc[0] > tc[2], tc
+    # 二维码矩阵：示例 URL 应为 29×29（v3，同参考样图）
+    mx = main.GalleryPlus._load_segno().make_qr(
+        main.WM_QR_URL.format(pid="87775536"), error="m").matrix
+    assert len(mx) == 29 and len(mx[0]) == 29 and mx[0][0] == 1, (len(mx), mx[0][0])
+    # 输出格式 png
     g.config["output_format"] = "png"
-    out2 = g._render_watermark(src)
-    assert out2.suffix == ".png" and out2.exists(), out2
+    out3 = g._render_watermark(src)
+    assert out3.suffix == ".png" and out3.exists(), out3
     g.config["output_format"] = "jpg"
-    print(f"水印渲染 OK: {w}x{h}（jpg/png 输出均通过）")
+    print(f"水印渲染 OK: {w}x{h}（几何/颜色/二维码/主题色均通过）")
 except ImportError:
     print("(无 PIL，跳过水印渲染检查)")
+
+# 9) 水印字体设置：读取/保存/非法字体拒绝
+res = _act("POST", {"action": "get_settings"})
+assert "fonts" in res and "available" in res and isinstance(res["available"], list), res
+assert res["fonts"]["cjk"] == "simhei.ttf", res  # 默认黑体
+res = _act("POST", {"action": "save_settings", "cjk": "simhei.ttf", "latin": "simhei.ttf"})
+assert res["ok"], res
+res = _act("POST", {"action": "save_settings", "cjk": "不存在的字体.ttf"})
+assert res["status"] == "error", res
+assert json.loads((_tmp / "settings.json").read_text(encoding="utf-8"))["wm_font_cjk"] == "simhei.ttf"
+
+# 9b) 上传字体：扩展名/内容校验（信任边界），有效字体进字体池并可被选中
+res = _act("POST", {"action": "upload_font", "name": "../evil.ttf", "data": base64.b64encode(b"x").decode()})
+assert res["status"] == "error", res  # 路径穿越被清洗成 evil.ttf 后仍会因内容非法被拒
+assert not list(g._fonts_dir.rglob("*")), "不应留下文件"
+res = _act("POST", {"action": "upload_font", "name": "x.exe", "data": base64.b64encode(b"x").decode()})
+assert res["status"] == "error", res
+res = _act("POST", {"action": "upload_font", "name": "fake.ttf", "data": base64.b64encode(b"not a font").decode()})
+assert res["status"] == "error" and res["message"] == "不是有效的字体文件", res
+assert not (g._fonts_dir / "fake.ttf").exists(), "校验失败的文件应被删除"
+sys_fonts = main._font_index(str(g._fonts_dir))
+if sys_fonts:  # 本机有字体时：上传一份真实字体文件 → 进索引 → 可被选为水印字体
+    src_font = Path(next(iter(sys_fonts.values())))
+    res = _act("POST", {"action": "upload_font", "name": "上传测试.ttf",
+                        "data": base64.b64encode(src_font.read_bytes()).decode()})
+    assert res["ok"] and res["name"] == "上传测试.ttf", res
+    assert "上传测试.ttf" in main._font_index(str(g._fonts_dir)), "上传后应进入字体索引"
+    res = _act("POST", {"action": "save_settings", "cjk": "上传测试.ttf"})
+    assert res["ok"], res
+    res = _act("POST", {"action": "get_settings"})
+    assert res["fonts"]["cjk"] == "上传测试.ttf", res
+else:
+    print("(本机无字体文件，跳过上传字体正向用例)")
 
 shutil.rmtree(_tmp)
 print("selftest OK")
