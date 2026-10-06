@@ -42,6 +42,7 @@ _mod("astrbot")
 event_mod = _mod("astrbot.api.event", AstrMessageEvent=object, filter=types.SimpleNamespace())
 filter_ns = event_mod.filter
 filter_ns.EventMessageType = types.SimpleNamespace(ALL=0)
+filter_ns.PermissionType = types.SimpleNamespace(ADMIN=0)
 
 
 def _passthrough(*a, **k):
@@ -54,7 +55,8 @@ for n in ("event_message_type", "command", "permission_type"):
     setattr(filter_ns, n, _passthrough)
 
 _mod("astrbot.api.message_components",
-     Image=type("Image", (), {"fromFileSystem": staticmethod(lambda p: p)}))
+     Image=type("Image", (), {"fromFileSystem": staticmethod(lambda p: p)}),
+     Reply=type("Reply", (), {}))
 _mod("astrbot.api.star",
      Context=object,
      Star=type("Star", (), {"__init__": lambda self, ctx: setattr(self, "context", ctx)}),
@@ -193,11 +195,11 @@ res = _act("POST", {"action": "list_images", "name": "测试库", "offset": 0, "
 assert res["total"] == 1 and res["images"][0]["file"] == "测试库-1.jpg", res
 res = _act("POST", {"action": "list_images", "name": "a/../b", "offset": 0, "limit": 50})
 assert res["status"] == "error", res
-# thumb（有 PIL 时：真图 → 小缩略图 + 磁盘缓存；坏图 → 404）
+# thumb（有 PIL 时：真图 → 缩略图 + 磁盘缓存；size 可选（封面要高清）；坏图 → 404）
 try:
     from PIL import Image as _P  # noqa: F401
     buf = io.BytesIO()
-    _P.new("RGB", (400, 300), "red").save(buf, "PNG")
+    _P.new("RGB", (1000, 800), "red").save(buf, "PNG")  # 大图：才能验证 size 档位
     _act("POST", {"action": "upload", "name": "测试库",
                   "files": [{"name": "real.png", "data": base64.b64encode(buf.getvalue()).decode()},
                             {"name": "junk.jpg", "data": base64.b64encode(b"junk").decode()}]})
@@ -209,7 +211,20 @@ try:
     assert res["src"].startswith("data:image/jpeg;base64,"), res
     tw, th = _P.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1]))).size
     assert max(tw, th) <= 240, (tw, th)
-    assert (g._tmp / "thumbs" / f"测试库_{Path(real).stem}.thumb.jpg").is_file()
+    assert (g._tmp / "thumbs" / f"测试库_{Path(real).stem}.240.thumb.jpg").is_file()
+    # size=640（主页封面档）：尺寸被采纳，且与默认档各留一份缓存
+    res = _act("POST", {"action": "thumb", "name": "测试库", "image": real, "size": 640})
+    cw, ch = _P.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1]))).size
+    assert max(cw, ch) == 640, (cw, ch)
+    assert (g._tmp / "thumbs" / f"测试库_{Path(real).stem}.640.thumb.jpg").is_file()
+    # 越界/垃圾 size 收敛到安全范围
+    for bad, want in ((99999, 1000), (-5, 80), ("垃圾", 240)):
+        res = _act("POST", {"action": "thumb", "name": "测试库", "image": real, "size": bad})
+        bw, bh = _P.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1]))).size
+        assert max(bw, bh) == want, (bad, bw, bh)
+    # 删图后各档缓存一起清（delete_image 的缓存清理已改为按档位通配）
+    assert g.delete_image("测试库", real)
+    assert not list((g._tmp / "thumbs").glob(f"测试库_{Path(real).stem}.*.thumb.jpg"))
     res = _act("POST", {"action": "thumb", "name": "测试库", "image": junk})
     assert res["status"] == "error", res
     res = _act("POST", {"action": "thumb", "name": "测试库", "image": "../x.jpg"})
@@ -225,6 +240,44 @@ assert res["ok"] and not (g._galleries / "测试库").exists(), res
 # 未知 action
 res = _act("POST", {"action": "????"})
 assert res["status"] == "error", res
+
+# 6b) 单图 PID 编辑 + 单图库水印开关 + 封面（0.1.3）
+_act("POST", {"action": "create", "name": "WM库"})
+res = _act("POST", {"action": "upload", "name": "WM库",
+                    "files": [{"name": "a.jpg", "data": base64.b64encode(b"z").decode()}]})
+fname = res["saved"][0]["file"]
+assert g._pids == {}, g._pids  # 前序用例清干净了，下面 set_pid 才可断言
+# set_pid：写入 → 落盘 → 清除
+res = _act("POST", {"action": "set_pid", "name": "WM库", "image": fname, "pid": "95026140_p0"})
+assert res["ok"] and res["pid"] == "95026140_p0", res
+assert g._pids[f"WM库/{fname}"] == "95026140_p0"
+assert json.loads((_tmp / "pids.json").read_text(encoding="utf-8"))[f"WM库/{fname}"] == "95026140_p0"
+res = _act("POST", {"action": "set_pid", "name": "WM库", "image": fname, "pid": ""})
+assert res["ok"] and res["pid"] is None and g._pids == {}, res
+# set_pid：防穿越 / 图片不存在
+res = _act("POST", {"action": "set_pid", "name": "WM库", "image": "../x.jpg", "pid": "1"})
+assert res["status"] == "error", res
+res = _act("POST", {"action": "set_pid", "name": "WM库", "image": "没有这张.jpg", "pid": "1"})
+assert res["status"] == "error", res
+# 分页列表带 wm 与随机封面
+res = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+row = next(x for x in res["galleries"] if x["name"] == "WM库")
+assert row["wm"] is True and row["cover"] == fname, res
+# set_wm：单库关闭 → 落盘；缺省（未设置过的库）仍为开
+res = _act("POST", {"action": "set_wm", "name": "WM库", "enabled": False})
+assert res["ok"] and res["wm"] is False, res
+assert g._gallery_wm("WM库") is False and g._gallery_wm("别的库") is True
+assert json.loads((_tmp / "settings.json").read_text(encoding="utf-8"))["gallery_wm"]["WM库"] is False
+res = _act("POST", {"action": "set_wm", "name": "不存在的库", "enabled": True})
+assert res["status"] == "error", res
+# 空库无封面；删库时水印开关一并清理
+_act("POST", {"action": "create", "name": "空库"})
+res = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+row = next(x for x in res["galleries"] if x["name"] == "空库")
+assert row["cover"] is None and row["wm"] is True, res
+assert g.delete_gallery("WM库")
+assert "WM库" not in json.loads((_tmp / "settings.json").read_text(encoding="utf-8"))["gallery_wm"]
+assert g.delete_gallery("空库")
 
 # 7) 批量导入：搭积木式文件名格式 → 解析、分库、pid、跳过原因
 rx, has_ext = main.build_filename_regex("{图库名}-{编号}.{扩展名}")
@@ -365,6 +418,75 @@ if sys_fonts:  # 本机有字体时：上传一份真实字体文件 → 进索�
     assert res["fonts"]["cjk"] == "上传测试.ttf", res
 else:
     print("(本机无字体文件，跳过上传字体正向用例)")
+
+# 10) 聊天端指令（0.1.3）：收集 / 查看图片 / 删除图片指令
+
+
+class _Ev:
+    """够用的假事件：只要 message_str / get_messages / plain_result / chain_result。"""
+
+    def __init__(self, text, messages=None):
+        self.message_str = text
+        self._msgs = messages or []
+
+    def get_messages(self):
+        return self._msgs
+
+    def plain_result(self, text):
+        return ("text", text)
+
+    def chain_result(self, chain):
+        return ("chain", chain)
+
+
+def _img_seg(payload=b"img-bytes"):
+    seg = main.Image()
+    seg.convert_to_base64 = lambda: base64.b64encode(payload).decode()
+    return seg
+
+
+def _reply(*segs):
+    r = main.Reply()
+    r.chain = list(segs)
+    return r
+
+
+def _run_command(gen):
+    async def collect():
+        return [r async for r in gen]
+
+    return asyncio.run(collect())
+
+
+_act("POST", {"action": "create", "name": "指令库"})
+# 收集：引用消息里的图片 → 入库（复用 save_upload 的命名/编号）
+out = _run_command(g.cmd_collect(_Ev("/收集 指令库", [_reply(_img_seg())])))
+assert out and out[0][0] == "text" and "已收集 1 张" in out[0][1], out
+files = [p.name for p in (g._galleries / "指令库").iterdir()]
+assert len(files) == 1 and files[0].startswith("指令库-"), files
+assert (g._galleries / "指令库" / files[0]).read_bytes() == b"img-bytes"
+# 收集：引用里没图 → 只提示，不入库
+out = _run_command(g.cmd_collect(_Ev("/收集 指令库")))
+assert "未在引用消息中找到图片" in out[0][1], out
+assert len(list((g._galleries / "指令库").iterdir())) == 1
+# 查看图片：全库随机一张
+out = _run_command(g.cmd_view(_Ev("/查看图片")))
+assert out and out[0][0] == "chain" and len(out[0][1]) == 1, out
+# 删除图片指令：默认删该库最近添加的一张
+newest = max((g._galleries / "指令库").iterdir(), key=lambda p: p.stat().st_mtime)
+out = _run_command(g.cmd_delete(_Ev("/删除图片指令 指令库")))
+assert f"已删除最近添加的图片：{newest.name}" in out[0][1], out
+assert not newest.exists()
+# 删除图片指令 <库> ALL：连库一起删
+_run_command(g.cmd_collect(_Ev("/收集 指令库", [_reply(_img_seg(b"x2"))])))
+out = _run_command(g.cmd_delete(_Ev("/删除图片指令 指令库 ALL")))
+assert "已删除图库「指令库」全部 1 张图片" in out[0][1], out
+assert not (g._galleries / "指令库").exists()
+# 删除图片指令：库不存在 / 缺参数
+out = _run_command(g.cmd_delete(_Ev("/删除图片指令 不存在的库")))
+assert "未找到与「不存在的库」匹配的图片" in out[0][1], out
+out = _run_command(g.cmd_delete(_Ev("/删除图片指令")))
+assert "用法" in out[0][1], out
 
 shutil.rmtree(_tmp)
 print("selftest OK")

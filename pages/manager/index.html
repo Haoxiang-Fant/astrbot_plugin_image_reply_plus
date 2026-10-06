@@ -8,7 +8,7 @@
 /* 跟随 AstrBot 亮暗主题（bridge 会在 <html> 上维护 data-theme）；一律直角 UI */
 :root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456;--err:#c0392b;--warn:#e67e22}
 [data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab;--err:#e74c3c;--warn:#e67e22}
-body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:960px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
+body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:1200px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
 h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 h2 small{color:var(--sub);font-weight:normal;font-size:13px}
 h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
@@ -19,14 +19,43 @@ button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
 label.up{cursor:pointer;color:var(--fg);background:var(--ctrl);border:1px solid var(--line);padding:8px 12px;font-size:14px}
 label.up:hover{background:var(--ctrl-hover)}
 .g{border:1px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px}
-.gal{cursor:pointer}.gal:hover{border-color:var(--sub)}
+/* 主页：一行四卡、卡片严格正方形；名称靠上、封面（object-fit 裁剪）居中、操作按钮靠下 */
+#list{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media (max-width:1000px){#list{grid-template-columns:repeat(2,1fr)}}
+/* 追加分页内容时禁止滚动锚定跟随（sentinel 也要排除，否则视口会被锚拉着跳到新内容末尾） */
+#list,#gimgs,#more-g,#more-i,#sentinel-g,#sentinel-i{overflow-anchor:none}
+@media (max-width:640px){#list{grid-template-columns:1fr}}
+.gal{cursor:pointer;margin-bottom:0;padding:0;display:flex;flex-direction:column;overflow:hidden;aspect-ratio:1}
+.gal:hover{border-color:var(--sub)}
+.gal .name{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:10px 12px 8px}
+.gal .name>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gal .name small{white-space:nowrap}
+.gal .cover{flex:1;display:flex;min-height:0;background:var(--ctrl)}
+.gal .cover img{width:100%;object-fit:cover;display:block;filter:saturate(.88);transition:filter .25s}
+.gal:hover .cover img{filter:none}
+.gal .cover.empty{align-items:center;justify-content:center;color:var(--sub);font-size:13px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.gal .ops{display:flex;gap:6px;align-items:center;padding:10px 12px}
+/* 三件（上传/水印/删除）必须排在一行：卡片是正方形且 overflow:hidden，换行会被裁掉 */
+.gal .ops>*{white-space:nowrap;font-size:13px;padding:6px 9px}
+.gal .ops input[type=checkbox]{margin:0 4px 0 0;vertical-align:-1px}
 .grid{display:flex;flex-wrap:wrap;gap:10px}
-.item{position:relative}
-.item img{width:120px;height:120px;object-fit:cover;display:block;background:#000}
+.item{--thumb:150px;position:relative;width:var(--thumb)}
+.item img{width:var(--thumb);height:var(--thumb);object-fit:cover;display:block;background:#000;cursor:zoom-in}
 .item img.bad{background:var(--panel);border:1px dashed var(--line);color:var(--err);font-size:11px;padding:4px;object-fit:contain}
-.item .x{position:absolute;top:0;right:0;background:var(--err);border:none;color:#fff;padding:1px 7px;cursor:pointer}
+/* 悬停才出现：右上删除、右下改 PID（按钮贴图片底边，尺寸跟着 --thumb 走） */
+.item .x,.item .edit{display:none;position:absolute;right:0;border:none;color:#fff;padding:1px 7px;cursor:pointer}
+.item:hover .x,.item:hover .edit{display:block}
+.item .x{top:0;background:var(--err)}
 .item .x.arm{background:var(--warn)}
-.item .pid{font-size:11px;color:var(--pid);margin-top:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .edit{top:calc(var(--thumb) - 18px);background:var(--pid)}
+.item .pid{font-size:11px;color:var(--pid);margin-top:2px;max-width:var(--thumb);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9}
+.modal[hidden]{display:none}
+.mbox{background:var(--panel);border:1px solid var(--line);padding:16px;width:min(420px,92vw)}
+#m-pid{width:100%;box-sizing:border-box}
+/* 点缩略图看大图：整屏遮罩，点任意处关闭 */
+#viewer{background:rgba(0,0,0,.88);cursor:zoom-out}
+#viewer img{max-width:92vw;max-height:92vh;display:block}
 .err{color:var(--err);white-space:pre-wrap;word-break:break-all}
 .hint{color:var(--sub);font-size:13px;margin:6px 0 10px;line-height:1.7}
 code{background:var(--ctrl);border:1px solid var(--line);padding:1px 5px;font-family:ui-monospace,Consolas,monospace}
@@ -63,6 +92,7 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
     <h3><span id="gal-title"></span> <small id="gal-count"></small></h3>
     <div class="bar">
       <label class="up">＋上传图片<input type="file" id="gal-up" accept="image/*" multiple hidden></label>
+      <label class="up" title="发送该图库图片时是否附加信息条（默认开启）"><input type="checkbox" id="gal-wm"> 水印</label>
       <button id="gal-del">删除图库</button>
     </div>
     <div id="gimgs" class="grid"></div>
@@ -125,6 +155,22 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
     <div id="wm-result"></div>
   </div>
 </div>
+
+<!-- PID 编辑弹窗 -->
+<div id="modal" class="modal" hidden>
+  <div class="mbox">
+    <h3>修改 PID</h3>
+    <p class="hint" id="m-file" style="margin:0 0 8px"></p>
+    <input id="m-pid" placeholder="pixiv 作品号，如 95026140_p0；留空清除" spellcheck="false">
+    <div class="bar" style="margin:12px 0 0">
+      <button id="m-ok">保存</button>
+      <button id="m-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 点缩略图看高清大图（点任意处关闭） -->
+<div id="viewer" class="modal" hidden><img id="viewer-img" alt=""></div>
 
 <script>
 "use strict";
@@ -232,8 +278,8 @@ $('#wm-font-file').onchange = e => run(async () => {
 
 // 后端返回 {src:...}；老版本信封/裸字符串也兼容（bridge 会剥掉顶层 data 键）
 const extractSrc = p => typeof p === 'string' ? p : (p && (p.src ?? p.data)) || null;
-function fetchSrc(gal, file){
-  return act({action:'thumb', name:gal, image:file})
+function fetchSrc(gal, file, size){
+  return act({action:'thumb', name:gal, image:file, size})
     .then(p => extractSrc(p))
     .then(src => src || Promise.reject(new Error('no thumb')))
     .catch(() => act({action:'raw', name:gal, image:file}).then(p => extractSrc(p)));
@@ -241,7 +287,7 @@ function fetchSrc(gal, file){
 function loadThumb(img){
   if (img.dataset.done) return;
   img.dataset.done = '1';
-  fetchSrc(img.dataset.g, img.dataset.f)
+  fetchSrc(img.dataset.g, img.dataset.f, img.dataset.s)
     .then(src => { if (src) img.src = src; else throw new Error('empty'); })
     .catch(e => { console.error('缩略图加载失败', img.dataset.g, img.dataset.f, e);
                   img.classList.add('bad'); img.alt = '加载失败'; img.title = img.dataset.f; });
@@ -262,14 +308,44 @@ const moreBtn = (sel, text) => { const b = $(sel); b.hidden = !text; if (text) b
 function galRow(g){
   const d = document.createElement('div');
   d.className = 'g gal';
-  d.innerHTML = `<h3><span>${esc(g.name)} <small>${g.count} 张</small></span><span class="ops">
-    <label class="up">＋上传<input type="file" accept="image/*" multiple hidden></label>
-    <button class="del">删除图库</button></span></h3>`;
-  d.onclick = () => run(() => openGallery(g.name));
+  d.innerHTML = `<div class="name"><span>${esc(g.name)}</span><small>${g.count} 张</small></div>
+    <div class="cover"></div>
+    <div class="ops">
+      <label class="up">＋上传<input type="file" accept="image/*" multiple hidden></label>
+      <label class="up" title="发送该图库图片时是否附加信息条"><input type="checkbox" class="wm"> 水印</label>
+      <button class="del">删除图库</button>
+    </div>`;
+  d.onclick = () => run(() => openGallery(g.name, g.wm));
   d.querySelector('.ops').onclick = e => e.stopPropagation();
   d.querySelector('input[type=file]').onchange = e => run(() => upload(g.name, e.target.files, () => loadGalleries(true)));
   d.querySelector('.del').onclick = e => run(() => delG(g.name, e.target));
+  const wm = d.querySelector('.wm');
+  wm.checked = g.wm !== false;                    // 缺省开
+  wm.onchange = e => run(async () => {            // 主界面直接开关；顺手更新内存值，进二级页时勾选态才对
+    g.wm = e.target.checked;
+    await act({action: 'set_wm', name: g.name, enabled: g.wm});
+  });
+  const cover = d.querySelector('.cover');
+  if (g.cover){  // 随机封面由后端每次列表挑一张，进视口才请求
+    const img = document.createElement('img');
+    img.alt = g.name; img.dataset.g = g.name; img.dataset.f = g.cover;
+    img.dataset.s = 640;  // 封面大图：四列卡片约 285px 宽（窄屏两列时约 460px），要高清；后端收敛到 80~1600
+    cover.appendChild(img);
+    observeImg(img);
+  } else {
+    cover.className += ' empty';
+    cover.textContent = '暂无图片';
+  }
   return d;
+}
+
+// 往列表里塞内容时钉住视口：新内容只向下拓展页面，用户与顶部的距离不变
+// （overflow-anchor 覆盖不到的场景，如 Safari，以及被 dashboard 包一层滚动容器时，靠这一手兜底）
+function pinScroll(mutate){
+  const sc = document.scrollingElement;
+  const top = sc.scrollTop;
+  mutate();
+  sc.scrollTop = top;
 }
 
 async function loadGalleries(reset){
@@ -281,9 +357,10 @@ async function loadGalleries(reset){
     const res = await act({action:'list_galleries', offset: S.off, limit: 20});
     const gs = pick(res, 'galleries') || [];
     S.total = pick(res, 'total');
+    const firstPage = S.off === 0;
     S.off += gs.length;
-    $('#list').innerHTML = '';  // 顺带清掉可能残留的「加载中…」（追加与清空同帧，无闪烁）
-    for (const g of gs) $('#list').appendChild(galRow(g));
+    if (firstPage) $('#list').innerHTML = '';  // 只清首页残留的「加载中…」；翻页必须追加，清了旧卡片就没了
+    pinScroll(() => { for (const g of gs) $('#list').appendChild(galRow(g)); });
     const done = S.total != null && S.off >= S.total;
     moreBtn('#more-g', done ? null : '加载更多');
     if (done && !$('#list').children.length) $('#list').textContent = '暂无关键词，先创建一个。';
@@ -294,9 +371,10 @@ async function loadGalleries(reset){
 
 // ---------- 二级：图库内图片（50/页） ----------
 
-async function openGallery(name){
+async function openGallery(name, wm){
   S.gal = name;
   $('#gal-title').textContent = name;
+  $('#gal-wm').checked = wm !== false;  // 缺省开
   $('#view-main').hidden = true;
   $('#view-import').hidden = true;
   $('#view-wm').hidden = true;
@@ -311,15 +389,50 @@ async function openGallery(name){
 function imgItem(gal, im){
   const it = document.createElement('div');
   it.className = 'item';
-  it.innerHTML = `<button class="x">✕</button>
+  it.innerHTML = `<button class="x" title="删除图片">✕</button>
+    <button class="edit" title="修改 PID">PID</button>
     <div class="pid" title="${esc(im.pid || '')}">${im.pid ? 'PID:' + esc(im.pid) : '无PID'}</div>`;
   it.querySelector('.x').onclick = e => run(() => delI(gal, im.file, e.target));
+  it.querySelector('.edit').onclick = () => editPid(gal, im, it.querySelector('.pid'));
   const img = document.createElement('img');
   img.dataset.g = gal; img.dataset.f = im.file;
+  img.dataset.s = 320;  // 缩略图显示 150px，取 320 档保清晰（后端收敛到 80~1600）
+  img.title = '点击查看大图';
+  img.onclick = () => run(() => viewBig(gal, im.file));
   it.prepend(img);
   observeImg(img);
   return it;
 }
+
+// 高清大图：直接复用 fetchSrc 的 thumb(1600) → raw 兜底链路，拿到的就是原图级清晰度
+async function viewBig(gal, file){
+  const box = $('#viewer');
+  box.hidden = false;
+  const img = $('#viewer-img');
+  img.removeAttribute('src');  // 先清上一张，避免看着旧图等新图
+  const src = await fetchSrc(gal, file, 1600);
+  if (src) img.src = src;
+}
+$('#viewer').onclick = () => { $('#viewer').hidden = true; $('#viewer-img').removeAttribute('src'); };
+
+// PID 弹窗：保存后就地更新标签，不整页刷新
+function editPid(gal, im, pidEl){
+  $('#modal').hidden = false;
+  $('#m-file').textContent = `${gal} / ${im.file}`;
+  $('#m-pid').value = im.pid || '';
+  $('#m-pid').focus();
+  $('#m-ok').onclick = () => run(async () => {
+    const res = await act({action:'set_pid', name:gal, image:im.file, pid:$('#m-pid').value.trim()});
+    im.pid = pick(res, 'pid') || null;
+    pidEl.textContent = im.pid ? 'PID:' + im.pid : '无PID';
+    pidEl.title = im.pid || '';
+    $('#modal').hidden = true;
+  });
+}
+$('#m-cancel').onclick = () => { $('#modal').hidden = true; };
+$('#modal').onclick = e => { if (e.target.id === 'modal') $('#modal').hidden = true; };
+$('#m-pid').onkeydown = e => { if (e.key === 'Enter') $('#m-ok').click(); };
+$('#gal-wm').onchange = e => run(() => act({action:'set_wm', name:S.gal, enabled:e.target.checked}));
 
 async function loadImages(reset){
   const gal = S.gal;
@@ -334,7 +447,7 @@ async function loadImages(reset){
     S.itotal = pick(res, 'total');
     S.ioff += imgs.length;
     $('#gal-count').textContent = `${S.itotal} 张`;
-    for (const im of imgs) $('#gimgs').appendChild(imgItem(gal, im));
+    pinScroll(() => { for (const im of imgs) $('#gimgs').appendChild(imgItem(gal, im)); });
     const done = S.itotal != null && S.ioff >= S.itotal;
     moreBtn('#more-i', done ? null : '加载更多');
     if (done && S.itotal === 0) $('#gimgs').innerHTML = '<p class="hint">图库是空的，上传几张吧。</p>';
@@ -491,6 +604,7 @@ function liveAppend(groups, it){
   item.innerHTML = `<div class="pid" title="${esc(it.file)}">${esc(it.file)}${it.pid ? '<br>PID:' + esc(it.pid) : ''}</div>`;
   const img = document.createElement('img');
   img.dataset.g = it.gallery; img.dataset.f = it.file;
+  img.dataset.s = 320;  // 与图库内缩略图同尺寸（.item 共用一套 CSS）
   item.prepend(img);
   observeImg(img);
   g.grid.appendChild(item);
