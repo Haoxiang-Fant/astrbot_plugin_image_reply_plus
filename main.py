@@ -5,7 +5,10 @@
 - 上传时识别 pixiv 命名（纯数字 / 数字_p数字）并记录 pid 到 pids.json
 - 文件统一重命名为 关键词-编号.扩展名
 - 发送时可选择在图片下方附加信息条（水印）：主色方块 + 文件名/PID + pixiv 二维码，
-  仅发送环节生成，几何按条高占比缩放，任何图片尺寸视觉一致；中/西文字体可在 WebUI 分别设置
+  仅发送环节生成，几何按条高占比缩放，任何图片尺寸视觉一致；中/西文字体可在 WebUI 分别设置；
+  是否加水印可按图库单独关闭（缺省开）
+- 原插件指令回归：收集（引用消息入库）/ 查看图片 / 删除图片指令，走 AstrBot 命令系统需命令前缀；
+  而群里发关键词随机取图仍然不需要任何前缀
 - WebUI 为 AstrBot 插件 Pages（仪表盘内管理页），后端 API 经 context.register_web_api 注册
 - 二维码生成内嵌 segno（BSD-3-Clause，https://github.com/heuer/segno，见 _segno/LICENSE）
 - 全部数据按 AstrBot 规范存放在 data/plugin_data/astrbot_plugin_image_reply_plus/
@@ -25,11 +28,11 @@ import shutil
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:  # 新版 AstrBot（FastAPI 时代）提供 astrbot.api.web
@@ -142,7 +145,7 @@ CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\
     PLUGIN_NAME,
     "cuman",
     "图库plus：关键词图库，一关键词一文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印。",
-    "0.1.2",
+    "0.1.3",
     "https://github.com/cumany/astrbot_plugin_image_replay",
 )
 class GalleryPlus(Star):
@@ -163,7 +166,7 @@ class GalleryPlus(Star):
         self._tmp.mkdir(parents=True, exist_ok=True)
         self._fonts_dir.mkdir(parents=True, exist_ok=True)
         self._pids: Dict[str, str] = self._load_pids()
-        self._settings: Dict[str, str] = self._load_settings()
+        self._settings: Dict[str, Any] = self._load_settings()
         self._register_page_apis()
 
     # ---------------- 消息响应 ----------------
@@ -190,11 +193,177 @@ class GalleryPlus(Star):
                 logger.debug(f"关键词“{kw}”图库为空")
                 return
             path = random.choice(imgs)
-            if self.config.get("watermark", True):
-                path = await asyncio.to_thread(self._render_watermark, path)
-            yield event.chain_result([Image.fromFileSystem(str(path))])
+            yield event.chain_result([await self._send_image(path)])
         except Exception as e:
             logger.error(f"图库plus 响应失败: {e}", exc_info=True)
+
+    # ---------------- 原插件指令回归（0.1.3）----------------
+    # 指令走 AstrBot 命令系统，需要命令前缀（如 /收集）；关键词回图仍是裸消息触发，无需前缀。
+
+    @filter.command("收集", alias={"添加图片", "添加表情"})
+    async def cmd_collect(self, event: AstrMessageEvent):
+        """收集 <图库名>：引用一条含图片的消息，把图片收进该图库。"""
+        _, args = self._split_command_args(event.message_str or "")
+        kw = self._safe_kw(args or "临时")
+        datas = await self._images_from_event(event)
+        if not datas:
+            yield event.plain_result("未在引用消息中找到图片，请先引用需要收集的图片。")
+            return
+        saved = []
+        for data in datas:
+            p = self.save_upload(kw, f"collect{self._detect_ext(data)}", data)
+            saved.append(p.name)
+        yield event.plain_result(
+            f"已收集 {len(saved)} 张图片进图库「{kw}」：{'、'.join(saved)}"
+        )
+
+    @filter.command("查看图片")
+    async def cmd_view(self, event: AstrMessageEvent):
+        """查看图片：从所有图库随机发一张。"""
+        imgs = [
+            p
+            for d in self._galleries.iterdir() if d.is_dir()
+            for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS
+        ]
+        if not imgs:
+            yield event.plain_result("未找到可用图片，请先创建图库并上传。")
+            return
+        yield event.chain_result([await self._send_image(random.choice(imgs))])
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("删除图片指令", alias={"删除图片"})
+    async def cmd_delete(self, event: AstrMessageEvent):
+        """删除图片指令 <图库名> [ALL]：删该库最近一张；带 ALL 连整个图库一起删。"""
+        _, args = self._split_command_args(event.message_str or "")
+        parts = args.split()
+        if not parts:
+            yield event.plain_result("用法：删除图片指令 <图库名> [ALL]")
+            return
+        kw = parts[0]
+        all_flag = len(parts) > 1 and parts[1].upper() == "ALL"
+        d = self._kw_dir(kw)
+        imgs = (
+            [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS]
+            if d and d.is_dir() else []
+        )
+        if not imgs:
+            yield event.plain_result(f"未找到与「{kw}」匹配的图片。")
+            return
+        if all_flag:
+            self.delete_gallery(d.name)
+            yield event.plain_result(f"已删除图库「{d.name}」全部 {len(imgs)} 张图片。")
+            return
+        target = max(imgs, key=lambda p: p.stat().st_mtime)  # 最近添加的
+        self.delete_image(d.name, target.name)
+        yield event.plain_result(f"已删除最近添加的图片：{target.name}")
+
+    async def _send_image(self, path: Path):
+        """发送一张图库图片，按全局开关与该图库开关决定是否附加信息条。"""
+        if self.config.get("watermark", True) and self._gallery_wm(path.parent.name):
+            path = await asyncio.to_thread(self._render_watermark, path)
+        return Image.fromFileSystem(str(path))
+
+    @staticmethod
+    def _split_command_args(message: str):
+        """首词与其余参数；无参数时第二项为空串。"""
+        parts = (message or "").strip().split(maxsplit=1)
+        return (parts[0], parts[1]) if len(parts) > 1 else (parts[0] if parts else "", "")
+
+    async def _images_from_event(self, event) -> List[bytes]:
+        """收集：取消息本体/引用消息里的全部图片字节。"""
+        datas = []
+        for seg in self._gather_image_segments(event):
+            data = await self._image_bytes(seg)
+            if data:
+                datas.append(data)
+        return datas or await self._reply_images_via_api(event)
+
+    @staticmethod
+    def _gather_image_segments(event) -> List:
+        segments, seen = [], set()
+
+        def collect(items) -> bool:
+            found = False
+            for seg in items or []:
+                if isinstance(seg, Image) and id(seg) not in seen:
+                    seen.add(id(seg))
+                    segments.append(seg)
+                    found = True
+                elif (
+                    isinstance(seg, Reply)
+                    and getattr(seg, "chain", None)
+                    and collect(seg.chain)
+                ):
+                    found = True
+            return found
+
+        chain = event.get_messages()
+        reply = next((s for s in chain if isinstance(s, Reply)), None)
+        if reply and collect(reply.chain or []):
+            return segments
+        collect(chain)
+        if not segments:  # 某些适配器图片不在 get_messages 里，翻原始消息
+            raw = getattr(getattr(event, "message_obj", None), "message", None)
+            if isinstance(raw, (list, tuple)):
+                collect(raw)
+        return segments
+
+    async def _image_bytes(self, seg) -> Optional[bytes]:
+        """Image 段 → 字节。convert_to_base64 是 AstrBot 原生方法，统一处理 url/file/base64。"""
+        try:
+            b64 = seg.convert_to_base64()
+            if asyncio.iscoroutine(b64):
+                b64 = await b64
+            if isinstance(b64, bytes):
+                return b64
+            if isinstance(b64, str):
+                return base64.b64decode(b64[9:] if b64.startswith("base64://") else b64)
+        except Exception as e:
+            logger.warning(f"读取图片段失败: {e}")
+        return None
+
+    async def _reply_images_via_api(self, event) -> List[bytes]:
+        """aiocqhttp 兜底：引用链里没有图片段时，用 get_msg 拉原消息取图。"""
+        try:
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                AiocqhttpMessageEvent,
+            )
+        except Exception:
+            return []
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return []
+        reply = next((s for s in event.get_messages() if isinstance(s, Reply)), None)
+        mid = getattr(reply, "id", None) or getattr(reply, "message_id", None)
+        client = getattr(event, "bot", None)
+        if not mid or not client:
+            return []
+        try:
+            res = await client.api.call_action("get_msg", message_id=str(mid))
+        except Exception as e:
+            logger.warning(f"获取引用消息失败: {e}")
+            return []
+        datas = []
+        for node in res.get("message") or []:
+            if not isinstance(node, Mapping) or node.get("type") != "image":
+                continue
+            url = (node.get("data") or {}).get("url")
+            if isinstance(url, str) and url:
+                data = await self._download(url)
+                if data:
+                    datas.append(data)
+        return datas
+
+    async def _download(self, url: str) -> Optional[bytes]:
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url) as r:
+                    r.raise_for_status()
+                    return await r.read()
+        except Exception as e:
+            logger.warning(f"图片下载失败: {e}")
+            return None
 
     # ---------------- 存储 ----------------
 
@@ -310,7 +479,8 @@ class GalleryPlus(Star):
         if not p.is_file():
             return False
         p.unlink()
-        (self._tmp / "thumbs" / f"{d.name}_{p.stem}.thumb.jpg").unlink(missing_ok=True)
+        for t in (self._tmp / "thumbs").glob(f"{d.name}_{p.stem}.*.thumb.jpg"):
+            t.unlink(missing_ok=True)  # 各档尺寸的缓存一起清（. 后接尺寸，不会误伤同前缀文件名）
         self._pids.pop(f"{d.name}/{name}", None)
         self._save_pids()
         return True
@@ -325,6 +495,9 @@ class GalleryPlus(Star):
         for key in [k for k in self._pids if k.startswith(f"{d.name}/")]:
             self._pids.pop(key, None)
         self._save_pids()
+        if isinstance(self._settings.get("gallery_wm"), dict):  # 库没了，水印开关一并清掉
+            self._settings["gallery_wm"].pop(d.name, None)
+            self._save_settings()
         return True
 
     def list_galleries(self) -> List[dict]:
@@ -340,6 +513,8 @@ class GalleryPlus(Star):
                 {
                     "name": d.name,
                     "count": len(names),
+                    "wm": self._gallery_wm(d.name),
+                    "cover": random.choice(names) if names else None,
                     "images": [
                         {"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in names
                     ],
@@ -348,19 +523,22 @@ class GalleryPlus(Star):
         return out
 
     def list_gallery_names(self, offset: int = 0, limit: Optional[int] = None):
-        """分页列出图库（只取名与张数，不列图片），供 WebUI 懒加载。返回 (页数据, 总数)。"""
+        """分页列出图库（名称、张数、水印开关、随机封面），供 WebUI 懒加载。返回 (页数据, 总数)。"""
         names = sorted(d.name for d in self._galleries.iterdir() if d.is_dir())
         page = names if limit is None else names[offset : offset + limit]
         out = []
         for name in page:
             d = self._galleries / name
+            files = [
+                p.name for p in d.iterdir()
+                if p.is_file() and p.suffix.lower() in EXTS
+            ]
             out.append(
                 {
                     "name": name,
-                    "count": sum(
-                        1 for p in d.iterdir()
-                        if p.is_file() and p.suffix.lower() in EXTS
-                    ),
+                    "count": len(files),
+                    "wm": self._gallery_wm(name),
+                    "cover": random.choice(files) if files else None,
                 }
             )
         return out, len(names)
@@ -393,6 +571,15 @@ class GalleryPlus(Star):
         self._settings_file.write_text(
             json.dumps(self._settings, ensure_ascii=False, indent=2), "utf-8"
         )
+
+    def _gallery_wm(self, kw: str) -> bool:
+        """单图库水印开关：settings.json 里的 gallery_wm 表，缺省开。"""
+        m = self._settings.get("gallery_wm")
+        return bool(m.get(kw, True)) if isinstance(m, dict) else True
+
+    def set_gallery_wm(self, kw: str, enabled: bool) -> None:
+        self._settings.setdefault("gallery_wm", {})[kw] = bool(enabled)
+        self._save_settings()
 
     def _wm_fonts(self, size: int):
         """按设置取 (中文字体, 西文字体)，各自带回退链（含管理员上传池）。"""
@@ -570,23 +757,30 @@ class GalleryPlus(Star):
 
     # ---------------- WebUI（AstrBot 插件 Pages 后端）----------------
 
-    def _thumb(self, kw: str, image: str) -> Optional[Path]:
-        """生成（带磁盘缓存）240px 小缩略图，返回路径；非法路径或 PIL 失败返回 None。"""
+    def _thumb(self, kw: str, image: str, px: int = 240) -> Optional[Path]:
+        """生成（带磁盘缓存）最长边 px 的缩略图，返回路径；非法路径或 PIL 失败返回 None。
+
+        主页封面要高清（前端 size=640），图库内网格用 240，各档各留一份缓存。
+        """
         d = self._kw_dir(kw)
         if not d or Path(image).name != image:
             return None
         p = d / image
         if not d.is_dir() or not p.is_file():
             return None
+        try:  # 信任边界：size 来自前端，收敛到 80~1600
+            px = min(max(int(px or 240), 80), 1600)
+        except (TypeError, ValueError):
+            px = 240
         tdir = self._tmp / "thumbs"
         tdir.mkdir(exist_ok=True)
-        out = tdir / f"{kw}_{p.stem}.thumb.jpg"
+        out = tdir / f"{kw}_{p.stem}.{px}.thumb.jpg"
         if out.is_file() and out.stat().st_mtime >= p.stat().st_mtime:
             return out
         try:
             from PIL import Image
             im = Image.open(p)
-            im.thumbnail((240, 240))
+            im.thumbnail((px, px))
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
             im.save(out, "JPEG", quality=80)
@@ -675,8 +869,12 @@ class GalleryPlus(Star):
             imgs, total = self.list_images(kw, off, lim)
             return json_response({"images": imgs, "total": total})
 
-        if action == "thumb":  # 小缩略图（服务端生成缓存，避免整图 base64 过桥）
-            t = self._thumb(str(payload.get("name", "")), str(payload.get("image", "")))
+        if action == "thumb":  # 缩略图（服务端生成缓存，避免整图 base64 过桥）；size 可选
+            t = self._thumb(
+                str(payload.get("name", "")),
+                str(payload.get("image", "")),
+                payload.get("size") or 240,
+            )
             if t is None:
                 return error_response("缩略图生成失败", status_code=404)
             b64 = base64.b64encode(t.read_bytes()).decode()
@@ -790,6 +988,26 @@ class GalleryPlus(Star):
                 return error_response("不是有效的字体文件", status_code=400)
             _font_index.cache_clear()  # 新字体进入索引
             return json_response({"ok": True, "name": fname})
+
+        if action == "set_pid":  # 改/清单张图片的 PID（WebUI 悬停编辑）
+            d = self._kw_dir(str(payload.get("name", "")))
+            image = str(payload.get("image", ""))
+            if not d or Path(image).name != image or not (d / image).is_file():
+                return error_response("图片不存在或非法", status_code=404)
+            pid = str(payload.get("pid", "")).strip()[:64]
+            if pid:
+                self._pids[f"{d.name}/{image}"] = pid
+            else:
+                self._pids.pop(f"{d.name}/{image}", None)
+            self._save_pids()
+            return json_response({"ok": True, "pid": pid or None})
+
+        if action == "set_wm":  # 单图库水印开关（缺省开）
+            d = self._kw_dir(str(payload.get("name", "")))
+            if not d or not d.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            self.set_gallery_wm(d.name, bool(payload.get("enabled", True)))
+            return json_response({"ok": True, "wm": self._gallery_wm(d.name)})
 
         return error_response("未知操作", status_code=400)
 
