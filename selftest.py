@@ -75,6 +75,17 @@ assert main.PID_RE.fullmatch("95026140") and main.PID_RE.fullmatch("95026140_p3"
 assert not main.PID_RE.fullmatch("abc123") and not main.PID_RE.fullmatch("123p4")
 assert not main.PID_RE.fullmatch("") and not main.PID_RE.fullmatch("_p3")
 
+# 1b) 真实下载文件名里的 pid：pximg 的 _master1200、PixEz 模板的作者/标题前后缀、illust_/pixiv_ 前缀
+assert main.GalleryPlus.extract_pid("95026140.jpg") == "95026140"
+assert main.GalleryPlus.extract_pid("95026140_p0.jpg") == "95026140_p0"
+assert main.GalleryPlus.extract_pid("95026140_p0_master1200.jpg") == "95026140_p0"
+assert main.GalleryPlus.extract_pid("作者名_95026140_p0.jpg") == "95026140_p0"
+assert main.GalleryPlus.extract_pid("标题_95026140_p0_标题.jpg") == "95026140_p0"
+assert main.GalleryPlus.extract_pid("illust_95026140_20230101.jpg") == "95026140"
+assert main.GalleryPlus.extract_pid("pixiv_95026140.png") == "95026140"
+assert main.GalleryPlus.extract_pid("IMG_20231006_123456.jpg") is None
+assert main.GalleryPlus.extract_pid("photo.png") is None
+
 # 0) 插件 Pages 后端 API 注册：单端点、GET+POST。
 #    插件标识以运行时元数据为准（实测部分版本 star.name = metadata.yaml 的 name），
 #    因此按 root_dir_name/module_path 找到自己，把 name/display_name/root_dir_name 全部注册。
@@ -104,6 +115,20 @@ assert {r[0] for r in regs} == {
 }, regs
 assert all(set(r[2]) == {"GET", "POST"} for r in regs)
 
+# 0b) metadata.yaml 必须是 AstrBot 认的格式：name=英文标识符（=目录名=@register 名），展示名走 display_name
+# 官方字段表见 https://docs.astrbot.app/dev/star/plugin-publish.html
+try:
+    import yaml
+    _md = yaml.safe_load((Path(__file__).parent / "metadata.yaml").read_text("utf-8"))
+    assert _md["name"] == main.PLUGIN_NAME, _md
+    assert _md["display_name"] == "图库plus", _md
+    assert _md["author"] and _md["desc"], _md
+    assert _md["repo"].startswith("https://github.com/"), _md
+    assert _md["version"] == main.PLUGIN_VERSION, _md  # 与 @register 的版本不许漂移
+    assert "id" not in _md, _md                        # id 不是 AstrBot 的字段（标识走 name）
+except ImportError:
+    print("(无 PyYAML，跳过 metadata.yaml 检查)")
+
 # 极端场景：插件目录名与注册名都不同，只能靠 star_cls_type 认领自己的元数据
 regs.clear()
 meta2 = types.SimpleNamespace(name="图库plus", display_name=None,
@@ -127,6 +152,14 @@ p3 = g.save_upload("可琳照片", "12345678.webp", b"c")
 assert p3.name == "可琳照片-3.webp" and g._pids["可琳照片/可琳照片-3.webp"] == "12345678"
 on_disk = json.loads((_tmp / "pids.json").read_text(encoding="utf-8"))
 assert on_disk["可琳照片/可琳照片-1.jpg"] == "95026140_p0"
+
+# 2b) 真实下载文件名入库：pid 绑定进 pids.json，编号照样接着该图库已有编号排
+p4 = g.save_upload("命名库", "作者名_95026140_p0_master1200.jpg", b"d")
+assert p4.name == "命名库-1.jpg" and g._pids["命名库/命名库-1.jpg"] == "95026140_p0"
+p5 = g.save_upload("命名库", "IMG_20231006_123456.jpg", b"e")
+assert p5.name == "命名库-2.jpg" and "命名库/命名库-2.jpg" not in g._pids
+assert json.loads((_tmp / "pids.json").read_text(encoding="utf-8"))["命名库/命名库-1.jpg"] == "95026140_p0"
+assert g.delete_gallery("命名库") and "命名库/命名库-1.jpg" not in g._pids
 
 # 3) 图库列表
 lst = g.list_galleries()
@@ -377,6 +410,12 @@ try:
     mx = main.GalleryPlus._load_segno().make_qr(
         main.WM_QR_URL.format(pid="87775536"), error="m").matrix
     assert len(mx) == 29 and len(mx[0]) == 29 and mx[0][0] == 1, (len(mx), mx[0][0])
+    # 地址只用 pid 里 _p 前面的数字：95026140_p0 与 95026140 必须生成同一张码，不同作品号则不同
+    q_p0 = main.GalleryPlus._qr_image("95026140_p0", 64)
+    q_num = main.GalleryPlus._qr_image("95026140", 64)
+    q_other = main.GalleryPlus._qr_image("95026141_p0", 64)
+    assert q_p0 is not None and q_p0.tobytes() == q_num.tobytes(), "带 _p 的 pid 生成地址时应忽略 _p 后的内容"
+    assert q_p0.tobytes() != q_other.tobytes(), "不同作品号应生成不同二维码"
     # 输出格式 png
     g.config["output_format"] = "png"
     out3 = g._render_watermark(src)
