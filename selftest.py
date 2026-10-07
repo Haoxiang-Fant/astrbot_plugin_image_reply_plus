@@ -422,7 +422,19 @@ try:
     out3 = g._render_watermark(src)
     assert out3.suffix == ".png" and out3.exists(), out3
     g.config["output_format"] = "jpg"
-    print(f"水印渲染 OK: {w}x{h}（几何/颜色/二维码/主题色均通过）")
+    # 发送门：单库关 → 原样发送；单库开 → 走水印渲染；全局关 → 一律原样（主界面水印开关的最终效果）
+    gate_dir = _tmp / "门库"
+    gate_dir.mkdir(exist_ok=True)
+    gate_img = gate_dir / "门库-1.jpg"
+    gate_img.write_bytes(_mkimg(300, 400))
+    g.set_gallery_wm("门库", False)
+    assert Path(asyncio.run(g._send_image(gate_img))) == gate_img, "单库关掉水印后应原样发送"
+    g.set_gallery_wm("门库", True)
+    assert Path(asyncio.run(g._send_image(gate_img))) != gate_img, "单库开着水印应渲染信息条"
+    g.config["watermark"] = False
+    assert Path(asyncio.run(g._send_image(gate_img))) == gate_img, "全局关掉后应一律原样发送"
+    g.config["watermark"] = True
+    print(f"水印渲染 OK: {w}x{h}（几何/颜色/二维码/主题色/发送门均通过）")
 except ImportError:
     print("(无 PIL，跳过水印渲染检查)")
 
@@ -527,6 +539,17 @@ out = _run_command(g.cmd_delete(_Ev("/删除图片指令 不存在的库")))
 assert "未找到与「不存在的库」匹配的图片" in out[0][1], out
 out = _run_command(g.cmd_delete(_Ev("/删除图片指令")))
 assert "用法" in out[0][1], out
+
+# 11) 图库排序：按拼音首字母逐字比较（安 an < 比 bi < 可 ke < 泽 ze；首字母同则看下一个字）
+pk = main.pinyin_key
+assert pk("安比") < pk("比亚迪") < pk("可琳") < pk("泽塔"), (pk("安比"), pk("比亚迪"), pk("可琳"), pk("泽塔"))
+assert pk("安比") < pk("爱姿"), (pk("安比"), pk("爱姿"))  # 首字母同为 a → 看第二个字（n < z）
+assert pk("123") < pk("abc") < pk("可琳"), (pk("123"), pk("abc"), pk("可琳"))
+(g._galleries / "泽塔照片").mkdir(exist_ok=True)
+(g._galleries / "安比照片").mkdir(exist_ok=True)
+names, _n = g.list_gallery_names()
+order = [r["name"] for r in names]
+assert order.index("安比照片") < order.index("泽塔照片"), order  # 安(a) 在 泽(z) 前
 
 shutil.rmtree(_tmp)
 print("selftest OK")
