@@ -1,7 +1,7 @@
 name: astrbot_plugin_image_reply_plus   # 插件标识符：英文、唯一，与目录名、@register 名一致
 display_name: 图库plus                  # 插件展示名称（中文名放这里，不要写进 name）
 desc: 关键词图库插件：一个关键词一个文件夹，WebUI 管理上传图片，随机回复并附加文件名/PID 水印，支持收集/查看/删除指令。
-version: 0.1.4                          # 插件版本号
+version: 0.1.5                          # 插件版本号
 author: Haoxiang-Fant                   # 作者名称（与仓库 owner 一致，插件标识 = author/name）
 repo: https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus   # 本插件仓库地址
 tags:                                   # 标签（插件市场分类/搜索用）

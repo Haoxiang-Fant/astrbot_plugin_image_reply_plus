@@ -77,7 +77,7 @@ except ImportError:
             return {"status": "error", "message": message, "data": data or {}}
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
-PLUGIN_VERSION = "0.1.4"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PLUGIN_VERSION = "0.1.5"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
 PLUGIN_AUTHOR = "Haoxiang-Fant"  # 同上：@register 与 metadata.yaml 的 author 都用它
 PLUGIN_REPO = "https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus"
 PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
@@ -113,6 +113,40 @@ MIME = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
 }
+# GBK 区间法取汉字拼音首字母：够排序用（多音字/生僻字可能归错字母，要精确再换 pypinyin）
+_PY_RANGE = (
+    (0xB0A1, "a"), (0xB0C5, "b"), (0xB2C1, "c"), (0xB4EE, "d"), (0xB6EA, "e"),
+    (0xB7A2, "f"), (0xB8C1, "g"), (0xB9FE, "h"), (0xBBF7, "j"), (0xBFA6, "k"),
+    (0xC0AC, "l"), (0xC2E8, "m"), (0xC4C3, "n"), (0xC5B6, "o"), (0xC5BE, "p"),
+    (0xC6DA, "q"), (0xC8BB, "r"), (0xC8F6, "s"), (0xCBFA, "t"), (0xCDDA, "w"),
+    (0xCEF4, "x"), (0xD1B9, "y"), (0xD4D1, "z"),
+)
+
+
+def pinyin_key(name: str):
+    """图库排序键：逐字取拼音首字母（首字母相同自然比到第二个字），非汉字用原字符小写。"""
+    key = []
+    for ch in name or "":
+        c = ch.lower()
+        try:
+            b = ch.encode("gbk")
+        except Exception:
+            key.append(c)
+            continue
+        if len(b) == 1:
+            key.append(chr(b[0]).lower())
+            continue
+        code = (b[0] << 8) | b[1]
+        if code < 0xB0A1:  # GBK 符号区，不参与拼音，按原字符排
+            key.append(c)
+            continue
+        for start, letter in _PY_RANGE:
+            if code >= start:
+                c = letter
+            else:
+                break
+        key.append(c)
+    return tuple(key)
 FONT_CANDIDATES = (
     "simhei.ttf", "msyh.ttc", "simsun.ttc",
     "notosanscjk-regular.ttc", "notosanssc-regular.otf", "wqy-microhei.ttc", "pingfang.ttc",
@@ -172,6 +206,8 @@ class GalleryPlus(Star):
         self._fonts_dir.mkdir(parents=True, exist_ok=True)
         self._pids: Dict[str, str] = self._load_pids()
         self._settings: Dict[str, Any] = self._load_settings()
+        # ponytail: 入库全局锁（并行上传时"算编号+写盘"必须原子，否则同名互覆）；瓶颈出现再拆图库级锁
+        self._save_lock = asyncio.Lock()
         self._register_page_apis()
 
     # ---------------- 消息响应 ----------------
@@ -215,9 +251,10 @@ class GalleryPlus(Star):
             yield event.plain_result("未在引用消息中找到图片，请先引用需要收集的图片。")
             return
         saved = []
-        for data in datas:
-            p = self.save_upload(kw, f"collect{self._detect_ext(data)}", data)
-            saved.append(p.name)
+        async with self._save_lock:
+            for data in datas:
+                p = self.save_upload(kw, f"collect{self._detect_ext(data)}", data)
+                saved.append(p.name)
         yield event.plain_result(
             f"已收集 {len(saved)} 张图片进图库「{kw}」：{'、'.join(saved)}"
         )
@@ -520,7 +557,7 @@ class GalleryPlus(Star):
 
     def list_galleries(self) -> List[dict]:
         out: List[dict] = []
-        for d in sorted(self._galleries.iterdir(), key=lambda p: p.name):
+        for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
             if not d.is_dir():
                 continue
             names = sorted(
@@ -542,7 +579,7 @@ class GalleryPlus(Star):
 
     def list_gallery_names(self, offset: int = 0, limit: Optional[int] = None):
         """分页列出图库（名称、张数、水印开关、随机封面），供 WebUI 懒加载。返回 (页数据, 总数)。"""
-        names = sorted(d.name for d in self._galleries.iterdir() if d.is_dir())
+        names = sorted((d.name for d in self._galleries.iterdir() if d.is_dir()), key=pinyin_key)
         page = names if limit is None else names[offset : offset + limit]
         out = []
         for name in page:
@@ -918,21 +955,22 @@ class GalleryPlus(Star):
             if not d or not d.is_dir():
                 return error_response("关键词不存在或非法", status_code=400)
             saved = []
-            for f in payload.get("files", []):
-                fname = str(f.get("name", ""))
-                b64 = str(f.get("data", ""))
-                if "," in b64:  # 容忍 dataURL 前缀
-                    b64 = b64.split(",", 1)[1]
-                if not fname or not b64:
-                    continue
-                try:
-                    data = base64.b64decode(b64)
-                except Exception:
-                    continue
-                if not data:
-                    continue
-                p = self.save_upload(d.name, fname, data)
-                saved.append({"file": p.name, "pid": self._pids.get(f"{d.name}/{p.name}")})
+            async with self._save_lock:  # 并行上传时串行化入库，编号不撞车
+                for f in payload.get("files", []):
+                    fname = str(f.get("name", ""))
+                    b64 = str(f.get("data", ""))
+                    if "," in b64:  # 容忍 dataURL 前缀
+                        b64 = b64.split(",", 1)[1]
+                    if not fname or not b64:
+                        continue
+                    try:
+                        data = base64.b64decode(b64)
+                    except Exception:
+                        continue
+                    if not data:
+                        continue
+                    p = self.save_upload(d.name, fname, data)
+                    saved.append({"file": p.name, "pid": self._pids.get(f"{d.name}/{p.name}")})
             return json_response({"ok": True, "saved": saved})
 
         if action == "delete_image":
@@ -959,7 +997,8 @@ class GalleryPlus(Star):
             pattern = str(payload.get("pattern", "")).strip()
             if "{图库名}" not in pattern:
                 return error_response("文件名格式必须包含 {图库名}")
-            return json_response(self.import_files(pattern, payload.get("files", [])))
+            async with self._save_lock:
+                return json_response(self.import_files(pattern, payload.get("files", [])))
 
         if action == "get_settings":  # 水印设置：当前字体 + 可用字体列表（系统 + 上传池）
             return json_response(
