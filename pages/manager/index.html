@@ -60,6 +60,12 @@ label.up:hover{background:var(--ctrl-hover)}
 .hint{color:var(--sub);font-size:13px;margin:6px 0 10px;line-height:1.7}
 code{background:var(--ctrl);border:1px solid var(--line);padding:1px 5px;font-family:ui-monospace,Consolas,monospace}
 #pattern{width:100%;font-family:ui-monospace,Consolas,monospace}
+/* 上传进度：原生 <progress> 拉平成本页的直角风格 */
+progress{width:100%;height:8px;border:1px solid var(--line);background:var(--ctrl);appearance:none;display:block;margin:8px 0}
+progress::-webkit-progress-bar{background:var(--ctrl)}
+progress::-webkit-progress-value{background:var(--sub)}
+progress::-moz-progress-bar{background:var(--sub)}
+.ulist p{margin:2px 0;font-size:13px;word-break:break-all}
 .sentinel{height:1px}
 #import-result ul{margin:6px 0;padding-left:20px}
 small{color:var(--sub)}
@@ -81,6 +87,7 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
     <input id="kw" placeholder="新关键词，如：可琳照片">
     <button onclick="run(create)">创建关键词</button>
   </div>
+  <div id="up-main"></div>
   <div id="list">加载中…</div>
   <div id="sentinel-g" class="sentinel"></div>
   <button id="more-g" onclick="run(loadGalleries)" hidden>加载更多</button>
@@ -95,6 +102,7 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
       <label class="up" title="发送该图库图片时是否附加信息条（默认开启）"><input type="checkbox" id="gal-wm"> 水印</label>
       <button id="gal-del">删除图库</button>
     </div>
+    <div id="up-gal"></div>
     <div id="gimgs" class="grid"></div>
     <div id="sentinel-i" class="sentinel"></div>
     <button id="more-i" onclick="run(loadImages)" hidden>加载更多</button>
@@ -223,6 +231,7 @@ function showMain(){
   $('#btn-wm').hidden = false;
   $('#btn-back').hidden = true;
   $('#import-result').innerHTML = '';
+  clearUp();
   run(() => loadGalleries(true));
 }
 function showImport(){
@@ -302,6 +311,8 @@ const observeImg = img => io ? io.observe(img) : loadThumb(img);
 // ---------- 一级：图库列表（20/页，滑到底自动加载，也有加载按钮） ----------
 
 const S = {off: 0, total: null, busyG: false, gal: null, ioff: 0, itotal: null, busyI: false};
+// 刚建的图库：本次会话里置顶显示（服务端一直按名称排序）；页面刷新后 pinG 归零，回到正常排序
+let pinG = null;
 const inView = el => { const r = el.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; };
 const moreBtn = (sel, text) => { const b = $(sel); b.hidden = !text; if (text) b.textContent = text; };
 
@@ -317,7 +328,11 @@ function galRow(g){
     </div>`;
   d.onclick = () => run(() => openGallery(g.name, g.wm));
   d.querySelector('.ops').onclick = e => e.stopPropagation();
-  d.querySelector('input[type=file]').onchange = e => run(() => upload(g.name, e.target.files, () => loadGalleries(true)));
+  d.querySelector('input[type=file]').onchange = e => {
+    const fs = Array.from(e.target.files);
+    e.target.value = '';  // 清掉才能再次选中同一批文件（否则 change 不触发）
+    run(() => upload(g.name, fs, () => loadGalleries(true), '#up-main'));
+  };
   d.querySelector('.del').onclick = e => run(() => delG(g.name, e.target));
   const wm = d.querySelector('.wm');
   wm.checked = g.wm !== false;                    // 缺省开
@@ -337,6 +352,15 @@ function galRow(g){
     cover.textContent = '暂无图片';
   }
   return d;
+}
+
+// 置顶卡片：张数与封面每次都从服务端取（上传完回主页看到的就是最新的）
+async function pinRow(){
+  const res = await act({action:'list_images', name: pinG.name, offset: 0, limit: 1});
+  const imgs = pick(res, 'images') || [];
+  pinG.count = pick(res, 'total') || 0;
+  pinG.cover = imgs.length ? imgs[0].file : null;
+  return galRow(pinG);
 }
 
 // 往列表里塞内容时钉住视口：新内容只向下拓展页面，用户与顶部的距离不变
@@ -359,8 +383,14 @@ async function loadGalleries(reset){
     S.total = pick(res, 'total');
     const firstPage = S.off === 0;
     S.off += gs.length;
-    if (firstPage) $('#list').innerHTML = '';  // 只清首页残留的「加载中…」；翻页必须追加，清了旧卡片就没了
-    pinScroll(() => { for (const g of gs) $('#list').appendChild(galRow(g)); });
+    if (firstPage){
+      $('#list').innerHTML = '';   // 只清首页残留的「加载中…」；翻页必须追加，清了旧卡片就没了
+      if (pinG) $('#list').appendChild(await pinRow());  // 新建的库排第一，张数/封面每次列表都重新取
+    }
+    // 置顶的库已单独渲染过，服务端页里跳过它，免得出现两张同名卡片
+    pinScroll(() => {
+      for (const g of gs) if (!(pinG && g.name === pinG.name)) $('#list').appendChild(galRow(g));
+    });
     const done = S.total != null && S.off >= S.total;
     moreBtn('#more-g', done ? null : '加载更多');
     if (done && !$('#list').children.length) $('#list').textContent = '暂无关键词，先创建一个。';
@@ -383,6 +413,7 @@ async function openGallery(name, wm){
   $('#btn-wm').hidden = true;
   $('#btn-back').hidden = false;
   scrollTo(0, 0);
+  clearUp();
   await loadImages(true);
 }
 
@@ -460,8 +491,9 @@ async function loadImages(reset){
 async function create(){
   const name = $('#kw').value.trim();
   if (!name) { fail('请先输入关键词'); return; }
-  await act({action: 'create', name});
+  const res = await act({action: 'create', name});
   $('#kw').value = '';
+  pinG = {name: pick(res, 'name') || name, count: 0, wm: true, cover: null};  // 新建的库置顶，刷新页面后回正常排序
   await loadGalleries(true);
 }
 
@@ -472,14 +504,48 @@ const readB64 = f => new Promise((ok, err) => {
   r.readAsDataURL(f);
 });
 
-async function upload(name, files, after){
-  if (!files || !files.length) return;
-  // ponytail: 走 JSON+base64（多文件、跨新旧 Web 层一条代码路径）；超大图再改 bridge.upload 逐张 multipart
-  const payload = {files: []};
-  for (const f of files) payload.files.push({name: f.name, data: await readB64(f)});
-  await act({action: 'upload', name, files: payload.files});
+// 上传：逐张走（读取 → 上传），页面上实时显示进度与每张的入库结果。
+// ponytail: 一张一请求，请求小、进度准；几百张的批量场景再考虑分批（批量导入页已是分批）
+async function upload(name, files, after, outSel){
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  const out = $(outSel || '#up-main');
+  out.textContent = '';
+  const card = document.createElement('div');
+  card.className = 'g';
+  card.innerHTML = `<h3><span>上传到「${esc(name)}」</span><small class="us">准备中…</small></h3>
+    <progress max="${list.length}" value="0"></progress><div class="ulist"></div>`;
+  out.appendChild(card);
+  const stat = card.querySelector('.us'), bar = card.querySelector('progress'), ulist = card.querySelector('.ulist');
+  const line = (cls, text) => {
+    const p = document.createElement('p');
+    p.className = cls;
+    p.textContent = text;
+    ulist.appendChild(p);
+  };
+  const t0 = Date.now();
+  let ok = 0, bad = 0;
+  for (let i = 0; i < list.length; i++){
+    const f = list[i];
+    stat.textContent = `读取 ${i + 1}/${list.length}：${f.name}`;
+    let data;
+    try { data = await readB64(f); }
+    catch (e) { bad++; line('err', `✕ ${f.name} — 读取失败`); bar.value = i + 1; continue; }
+    stat.textContent = `上传 ${i + 1}/${list.length}：${f.name}`;
+    try {
+      const res = await act({action: 'upload', name, files: [{name: f.name, data}]});
+      const saved = pick(res, 'saved') || [];
+      if (!saved.length) throw new Error('未入库');
+      for (const s of saved){ ok++; line('hint', `✓ ${s.file}${s.pid ? ' ｜ PID:' + s.pid : ''}`); }
+    } catch (e) { bad++; line('err', `✕ ${f.name} — ${(e && e.message) || '上传失败'}`); }
+    bar.value = i + 1;
+  }
+  stat.textContent = `成功 ${ok} 张${bad ? ` ／ 失败 ${bad} 张` : ''} ／ 共 ${list.length} 张 ／ 耗时 ${fmtSec((Date.now() - t0) / 1000)}`;
   if (after) await after();
 }
+
+// 切视图时把上一次的上传成果卡清掉，免得看到过期进度
+function clearUp(){ for (const id of ['#up-main', '#up-gal']) $(id).textContent = ''; }
 
 // 沙箱内 confirm 不可用：两次点击确认（第一次点变橙色“确认删除?”，再点执行）
 function armed(btn, text){
@@ -501,10 +567,15 @@ async function delI(name, image, btn){
 async function delG(name, btn){
   if (!armed(btn, '确认删除图库?')) return;
   await act({action: 'delete', name});
+  if (pinG && pinG.name === name) pinG = null;  // 置顶的库没了，别留幽灵卡片
   if (S.gal === name) await showMain();
   else await loadGalleries(true);
 }
-$('#gal-up').onchange = e => run(() => upload(S.gal, e.target.files, () => loadImages(true)));
+$('#gal-up').onchange = e => {
+  const fs = Array.from(e.target.files);
+  e.target.value = '';  // 清掉才能再次选中同一批文件
+  run(() => upload(S.gal, fs, () => loadImages(true), '#up-gal'));
+};
 $('#gal-del').onclick = e => run(() => delG(S.gal, e.target));
 
 // ---------- 批量导入 ----------

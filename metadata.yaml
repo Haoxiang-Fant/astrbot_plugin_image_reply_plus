@@ -1,10 +1,9 @@
-id: astrbot_plugin_image_reply_plus
-name: 图库plus
-author: cuman
-desc: 关键词图库插件：一个关键词一个文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印，支持收集/查看/删除指令。
-version: "0.1.3"
-repo: https://github.com/cumany/astrbot_plugin_image_replay
-homepage: https://github.com/cumany/astrbot_plugin_image_replay
-tags:
+name: astrbot_plugin_image_reply_plus   # 插件标识符：英文、唯一，与目录名、@register 名一致
+display_name: 图库plus                  # 插件展示名称（中文名放这里，不要写进 name）
+desc: 关键词图库插件：一个关键词一个文件夹，WebUI 管理上传图片，随机回复并附加文件名/PID 水印，支持收集/查看/删除指令。
+version: 0.1.4                          # 插件版本号
+author: cuman                           # 作者名称
+repo: https://github.com/cumany/astrbot_plugin_image_replay   # 插件仓库地址
+tags:                                   # 标签（插件市场分类/搜索用）
   - image
   - automation

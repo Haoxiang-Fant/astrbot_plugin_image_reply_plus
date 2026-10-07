@@ -2,7 +2,7 @@
 """图库plus：关键词图库插件。
 
 - 一个关键词一个文件夹，消息首词命中关键词即随机回一张图
-- 上传时识别 pixiv 命名（纯数字 / 数字_p数字）并记录 pid 到 pids.json
+- 上传时识别 pixiv 作品号（纯数字 / 数字_p数字 / 名字里嵌的作品号 / illust_·pixiv_ 前缀）并记录 pid 到 pids.json
 - 文件统一重命名为 关键词-编号.扩展名
 - 发送时可选择在图片下方附加信息条（水印）：主色方块 + 文件名/PID + pixiv 二维码，
   仅发送环节生成，几何按条高占比缩放，任何图片尺寸视觉一致；中/西文字体可在 WebUI 分别设置；
@@ -77,7 +77,10 @@ except ImportError:
             return {"status": "error", "message": message, "data": data or {}}
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
-PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（pixiv 作品命名）
+PLUGIN_VERSION = "0.1.4"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
+PID_ANY_RE = re.compile(r"(\d+)_p(\d+)")  # 名字里嵌的 pixiv 签名（pximg 的 _master1200、PixEz 模板的作者/标题前后缀）
+PID_PREFIX_RE = re.compile(r"^(?:illust|pixiv)[_-](\d+)", re.I)  # illust_/pixiv_ 前缀
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 # 批量导入的"积木"：占位符 → 正则片段。/ {格式} 与 {扩展名} 等价。
 FILENAME_BLOCKS = {
@@ -145,7 +148,7 @@ CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\
     PLUGIN_NAME,
     "cuman",
     "图库plus：关键词图库，一关键词一文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印。",
-    "0.1.3",
+    PLUGIN_VERSION,
     "https://github.com/cumany/astrbot_plugin_image_replay",
 )
 class GalleryPlus(Star):
@@ -409,6 +412,20 @@ class GalleryPlus(Star):
         except Exception:
             return ".jpg"
 
+    @staticmethod
+    def extract_pid(filename: str) -> Optional[str]:
+        """从文件名取 pixiv 作品号：整名即 pid → 名字里嵌 `数字_p数字` → illust_/pixiv_ 前缀；取不到返回 None。
+
+        例：95026140_p0.jpg / 95026140.jpg / 95026140_p0_master1200.jpg /
+            作者名_95026140_p0.jpg / illust_95026140_20230101.jpg 都能取到。
+        """
+        stem = Path(filename).stem
+        if m := PID_ANY_RE.search(stem):
+            return f"{m.group(1)}_p{m.group(2)}"
+        if m := PID_PREFIX_RE.match(stem):
+            return m.group(1)
+        return stem if PID_RE.fullmatch(stem) else None
+
     def save_upload(
         self, kw: str, filename: str, data: bytes, pid: Optional[str] = None
     ) -> Path:
@@ -419,9 +436,8 @@ class GalleryPlus(Star):
         ext = Path(filename).suffix.lower()
         if ext not in EXTS:
             ext = self._detect_ext(data)
-        stem = Path(filename).stem
         if pid is None:
-            pid = stem if PID_RE.fullmatch(stem) else None
+            pid = self.extract_pid(filename)
         n = self._next_num(folder, kw)
         target = folder / f"{kw}-{n}{ext}"
         while target.exists():
