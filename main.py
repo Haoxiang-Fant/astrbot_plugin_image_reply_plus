@@ -78,6 +78,8 @@ except ImportError:
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
 PLUGIN_VERSION = "0.1.4"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PLUGIN_AUTHOR = "Haoxiang-Fant"  # 同上：@register 与 metadata.yaml 的 author 都用它
+PLUGIN_REPO = "https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus"
 PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
 PID_ANY_RE = re.compile(r"(\d+)_p(\d+)")  # 名字里嵌的 pixiv 签名（pximg 的 _master1200、PixEz 模板的作者/标题前后缀）
 PID_PREFIX_RE = re.compile(r"^(?:illust|pixiv)[_-](\d+)", re.I)  # illust_/pixiv_ 前缀
@@ -146,10 +148,10 @@ CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\
 
 @register(
     PLUGIN_NAME,
-    "cuman",
+    PLUGIN_AUTHOR,
     "图库plus：关键词图库，一关键词一文件夹，WebUI 管理上传，随机回复并附加文件名/PID 水印。",
     PLUGIN_VERSION,
-    "https://github.com/cumany/astrbot_plugin_image_replay",
+    PLUGIN_REPO,
 )
 class GalleryPlus(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):

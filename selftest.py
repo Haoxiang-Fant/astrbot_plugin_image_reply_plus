@@ -122,8 +122,9 @@ try:
     _md = yaml.safe_load((Path(__file__).parent / "metadata.yaml").read_text("utf-8"))
     assert _md["name"] == main.PLUGIN_NAME, _md
     assert _md["display_name"] == "图库plus", _md
-    assert _md["author"] and _md["desc"], _md
-    assert _md["repo"].startswith("https://github.com/"), _md
+    assert _md["author"] == main.PLUGIN_AUTHOR, _md
+    assert _md["repo"] == main.PLUGIN_REPO and main.PLUGIN_NAME in _md["repo"], _md  # 指向本插件仓库
+    assert _md["desc"], _md
     assert _md["version"] == main.PLUGIN_VERSION, _md  # 与 @register 的版本不许漂移
     assert "id" not in _md, _md                        # id 不是 AstrBot 的字段（标识走 name）
 except ImportError:
