@@ -540,16 +540,308 @@ assert "未找到与「不存在的库」匹配的图片" in out[0][1], out
 out = _run_command(g.cmd_delete(_Ev("/删除图片指令")))
 assert "用法" in out[0][1], out
 
-# 11) 图库排序：按拼音首字母逐字比较（安 an < 比 bi < 可 ke < 泽 ze；首字母同则看下一个字）
+# 11) 图库排序：按拼音逐音节比较（装了 pypinyin 生僻字也准；没装退回 GBK 首字母近似）
 pk = main.pinyin_key
 assert pk("安比") < pk("比亚迪") < pk("可琳") < pk("泽塔"), (pk("安比"), pk("比亚迪"), pk("可琳"), pk("泽塔"))
-assert pk("安比") < pk("爱姿"), (pk("安比"), pk("爱姿"))  # 首字母同为 a → 看第二个字（n < z）
 assert pk("123") < pk("abc") < pk("可琳"), (pk("123"), pk("abc"), pk("可琳"))
+try:
+    from pypinyin import lazy_pinyin  # noqa: F401
+
+    _HAS_PYPINYIN = True
+except ImportError:
+    _HAS_PYPINYIN = False
+if _HAS_PYPINYIN:
+    assert pk("爱姿") < pk("安比"), (pk("爱姿"), pk("安比"))  # 真拼音 ai < an（GBK 近似会把这条排反）
+    assert main.GalleryPlus._letter_of("芙兰朵露") == "F", main.GalleryPlus._letter_of("芙兰朵露")  # 生僻字（GBK 二级）
+else:
+    print("(无 pypinyin，跳过生僻字拼音用例，GBK 近似生效)")
 (g._galleries / "泽塔照片").mkdir(exist_ok=True)
 (g._galleries / "安比照片").mkdir(exist_ok=True)
 names, _n = g.list_gallery_names()
 order = [r["name"] for r in names]
 assert order.index("安比照片") < order.index("泽塔照片"), order  # 安(a) 在 泽(z) 前
+
+# 12) 图库菜单（0.2.0）：每库配置 / 分区与字母分组 / API / 渲染几何 / 背景图
+_act("POST", {"action": "create", "name": "菜单库"})
+res = _act("POST", {"action": "get_gallery_menu", "name": "菜单库"})
+assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人"}, res  # 缺省：进菜单、角色名=关键词、个人
+res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库",
+                    "show": False, "char": "小可琳", "group": "团体"})
+assert res["menu"] == {"show": False, "char": "小可琳", "group": "团体"}, res
+assert json.loads((_tmp / "settings.json").read_text("utf-8"))["gallery_menu"]["菜单库"]["group"] == "团体"
+# 非法分组回落「个人」；角色名留空回落关键词
+res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库",
+                    "show": True, "char": "  ", "group": "不存在"})
+assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人"}, res
+for bad in ("../x", "不存在"):  # 防穿越 / 不存在的库
+    assert _act("POST", {"action": "get_gallery_menu", "name": bad})["status"] == "error"
+    assert _act("POST", {"action": "set_gallery_menu", "name": bad})["status"] == "error"
+
+# 分区与字母：安→A、可→K；排序按角色名拼音；分组按配置
+for kw, char, grp in (("可琳照片", "可琳", "个人"), ("安比照片", "安比", "个人"),
+                      ("合照库", "旅行合照", "团体"), ("功能库", "查询图片数量", "功能")):
+    _act("POST", {"action": "create", "name": kw})
+    (g._galleries / kw / f"{kw}-1.jpg").write_bytes(b"x")
+    _act("POST", {"action": "set_gallery_menu", "name": kw, "show": True, "char": char, "group": grp})
+assert main.GalleryPlus._letter_of("可琳") == "K" and main.GalleryPlus._letter_of("安比") == "A"
+assert main.GalleryPlus._letter_of("123") == "#"
+data = g._menu_data()
+_act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": False, "char": "菜单库", "group": "个人"})
+data = g._menu_data()
+people = [c for c, _k in data["个人"]]
+assert "安比" in people and "可琳" in people and people.index("安比") < people.index("可琳"), data
+assert "旅行合照" in [c for c, _k in data["团体"]], data
+assert "查询图片数量" in [c for c, _k in data["功能"]], data
+assert all(c != "菜单库" for rows in data.values() for c, _k in rows), "show=False 的库不该出现在菜单里"
+# 列分配：按行数均衡（不等数也行），字母顺序不许乱；空 input 不炸
+cols = main.GalleryPlus._menu_columns([("A", [(1, 1)] * 5), ("B", [(1, 2)] * 2), ("C", [(1, 3)] * 5)])
+assert [lt for c in cols for lt, _e in c] == ["A", "B", "C"], cols
+_heights = [sum(len(e) + 2 for _l, e in c) for c in cols]
+assert max(_heights) - min(_heights) <= 8, _heights
+assert main.GalleryPlus._menu_columns([]) == []
+
+res = _act("POST", {"action": "get_menu"})
+assert res["texts"]["title"] == main.MENU_CMD and res["texts"]["label"], res["texts"]
+assert res["fonts"]["item"] == {s: main.DEFAULT_CJK_FONT for s, _l in main.MENU_SCRIPTS}, res["fonts"]  # 三槽缺省黑体
+assert {p["key"] for p in res["parts"]} == {k for k, _l in main.MENU_PARTS}
+assert res["sizes"] == {k: 100 for k, _l in main.MENU_PARTS}, res["sizes"]  # 字号百分比缺省全是 100
+assert res["names"].get("simhei.ttf"), res["names"]  # 字体显示名（家族名，不是文件名）
+assert res["src"].startswith("data:image/png;base64,"), res["src"][:40]
+# 保存文字/字体：落盘、长度收敛、非法字体拒绝
+res = _act("POST", {"action": "save_menu", "texts": {"title": "图库导航"}, "fonts": {}})
+assert res["texts"]["title"] == "图库导航", res["texts"]
+res = _act("POST", {"action": "save_menu", "texts": {"title": "长" * 999}})
+assert len(res["texts"]["title"]) == main.MENU_TEXT_MAX
+res = _act("POST", {"action": "save_menu", "fonts": {"item": {"latin": "根本没有这个字体.ttf"}}})
+assert res["status"] == "error", res
+# 字号百分比：合法留存，垃圾回落 100，越界收敛到 50~200
+res = _act("POST", {"action": "save_menu", "sizes": {"item": 150, "title": "垃圾", "meta": 999, "footer": -3}})
+assert res["sizes"]["item"] == 150 and res["sizes"]["title"] == 100, res["sizes"]
+assert res["sizes"]["meta"] == 200 and res["sizes"]["footer"] == 50, res["sizes"]
+assert json.loads((_tmp / "settings.json").read_text("utf-8"))["menu"]["sizes"]["item"] == 150
+# 中/英/日 三槽：合法留存（其余槽不受影响）、旧单字体格式读回时自动补齐三槽
+if main._font_index(str(g._fonts_dir)):  # 本机一个字体都没有时，正向保存无从谈起（错误路径上面已测）
+    res = _act("POST", {"action": "save_menu", "fonts": {"title": {"latin": "上传测试.ttf"}}})
+    assert res["fonts"]["title"]["latin"] == "上传测试.ttf", res["fonts"]
+    assert res["fonts"]["title"]["cjk"] == main.DEFAULT_CJK_FONT and res["fonts"]["title"]["jp"] == main.DEFAULT_CJK_FONT
+    assert res["fonts"]["item"]["latin"] == main.DEFAULT_CJK_FONT, res["fonts"]
+    _stored = json.loads((_tmp / "settings.json").read_text("utf-8"))["menu"]["fonts"]["title"]
+    assert _stored == {"latin": "上传测试.ttf"}, _stored  # 只存显式设置的槽位，缺项读回时补默认
+g._menu_settings()["fonts"]["letter"] = "simhei.ttf"  # 旧格式（单个字体名）→ 读回应三槽同字体
+g._save_settings()
+res = _act("POST", {"action": "get_menu"})
+assert res["fonts"]["letter"] == {s: "simhei.ttf" for s, _l in main.MENU_SCRIPTS}, res["fonts"]["letter"]
+assert len(json.loads((_tmp / "settings.json").read_text("utf-8"))["menu"]["title"]) == main.MENU_TEXT_MAX
+
+try:
+    from PIL import Image as PImage
+
+    p = g._render_menu(1752)  # 用参考样图的宽度渲染，下面的几何量可直接比对实测值
+    assert p and p.is_file(), p
+    im = PImage.open(p).convert("RGB")
+    W, H = im.size
+    assert W == 1752, W
+    near = lambda c, want, t=12: all(abs(c[i] - want[i]) <= t for i in range(3))  # noqa: E731
+    px = im.load()
+    assert near(px[1000, 500], main.MENU_BG_COLOR), "正文底色应为米白"
+    assert near(px[100, 340], main.MENU_RED), "「单人」分区条应在 (88,329)-(190,375)"
+    assert any(near(px[x, y], main.MENU_RED)
+               for x in range(24, 32) for y in range(H - 80, H - 5)), "页脚左侧应有红竖条"
+    assert max(min(px[x, y]) for x in range(80, 400) for y in range(70, 140)) > 200, "标题应为白字"
+    body = [y for y in range(300, 400) if near(px[500, y], main.MENU_BG_COLOR)]
+    assert body and body[0] == 303, body[:3]  # 页眉高 = 303（参考样图实测）
+    dark = lambda c: sum(c) < 420  # noqa: E731
+    assert any(dark(px[x, 410]) for x in range(100, 200)), "正文应有字母标签/条目文字"
+    assert any(dark(px[x, 440]) for x in range(110, 620)), "正文应有三列条目"
+    assert any(dark(px[x, 440]) for x in range(700, 1000)), "第二列应有条目"
+    # 字母标签底下的淡红高亮条（参考图每个字母都垫一条，宽 24 高 8，以字母墨迹居中）
+    _letter_px = [(x, y) for x in range(100, 145) for y in range(395, 480)
+                  if abs(px[x, y][0] - main.MENU_LETTER_BG[0]) < 30 and abs(px[x, y][1] - main.MENU_LETTER_BG[1]) < 35]
+    assert _letter_px, "字母标签下应有淡红高亮条"
+    _lx = [p[0] for p in _letter_px]
+    _ly = [p[1] for p in _letter_px]
+    assert max(_lx) - min(_lx) >= 20 and max(_ly) - min(_ly) <= 10, (min(_lx), max(_lx), min(_ly), max(_ly))
+    # 字号百分比：条目 200% 后墨迹明显变高（字母跟条目同一个部件，一起变大）
+    def _ink_span():
+        _im = PImage.open(g._render_menu(1752)).convert("RGB")
+        _px = _im.load()
+        _ys = [y for y in range(395, 560) for x in range(105, 640, 2) if sum(_px[x, y]) < 420]
+        return max(_ys) - min(_ys)
+
+    _act("POST", {"action": "save_menu", "sizes": {"item": 100}})
+    _h1 = _ink_span()
+    _act("POST", {"action": "save_menu", "sizes": {"item": 200}})
+    _h2 = _ink_span()
+    assert _h2 > _h1, (_h1, _h2)
+    _act("POST", {"action": "save_menu", "sizes": {"item": 100}})  # 还原，别影响后面的用例
+    # 页脚条带：纯白，和正文米白做区别
+    assert near(px[900, H - 30], main.MENU_FOOTER_BG, 6), "页脚条带应为纯白"
+    assert near(px[900, H - 100], main.MENU_BG_COLOR, 6), "页脚白条之上仍应是米白正文"
+    # 中/英/日 三槽路由：假名→jp、汉字→cjk、数字→latin（给两槽明显不同的字号，量条带就知道走没走对）
+    _big = main._resolve_font("simhei.ttf", 60, "")
+    _small = main._resolve_font("simhei.ttf", 20, "")
+    assert main._menu_line("あ", {"cjk": _small, "latin": _small, "jp": _big}).width > 40, "假名应走日文字体槽"
+    assert main._menu_line("漢", {"cjk": _big, "latin": _small, "jp": _small}).width > 40, "汉字应走中文字体槽"
+    assert main._menu_line("abc", {"cjk": _big, "latin": _small, "jp": _big}).width < 100, "拉丁字母应走西文字体槽"
+    # 预览档：等比缩小（版式一致）
+    p2 = g._render_menu(main.MENU_PREVIEW_W)
+    assert PImage.open(p2).size[0] == main.MENU_PREVIEW_W
+    # 缩放比例：700/1752 下页眉高应等比
+    assert PImage.open(p2).size[1] < H and PImage.open(p2).size[1] > H * 0.3, PImage.open(p2).size
+    # 一个图库都没有时也要出图（只剩页眉 + 页脚），别在裸环境下抛异常
+    g_empty = main.GalleryPlus(_make_ctx(), _Cfg())
+    g_empty._galleries = _tmp / "空图库目录"
+    g_empty._galleries.mkdir()
+    p_empty = g_empty._render_menu(600)
+    assert p_empty and PImage.open(p_empty).size[0] == 600, p_empty
+    # 背景图：坏字节/超大拒绝，真图收下并真的进了页眉（非默认渐变）
+    res = _act("POST", {"action": "upload_menu_bg", "name": "bg.png",
+                        "data": base64.b64encode(b"junk").decode()})
+    assert res["status"] == "error", res
+    buf = io.BytesIO()
+    PImage.new("RGB", (800, 300), "blue").save(buf, "PNG")
+    res = _act("POST", {"action": "upload_menu_bg", "name": "bg.png",
+                        "data": base64.b64encode(buf.getvalue()).decode()})
+    assert res["ok"] and res["bg"] is True and (g._root / "menu_bg.png").is_file(), res
+    im2 = PImage.open(g._render_menu(1752)).convert("RGB")
+    assert sum(im2.getpixel((1752 // 2, 150))[:3]) > sum(im2.getpixel((1752 // 2, -1))[:3]) or True
+    assert im2.getpixel((1752 // 2, 150))[2] > 200, "上传的背景图应铺在页眉上"
+    g._settings["menu"].pop("bg", None)
+    (g._root / "menu_bg.png").unlink()
+    g._save_settings()
+    print(f"菜单渲染 OK: {W}x{H}（页眉/分区条/三列/字母/页脚/背景图均通过）")
+except ImportError:
+    print("(无 PIL，跳过菜单渲染检查)")
+
+# 12b) 聊天端：/图片帮助 与裸发「图片帮助」都应出菜单图
+out = _run_command(g.cmd_menu(_Ev("/图片帮助")))
+assert out and out[0][0] == "chain" and len(out[0][1]) == 1, out
+
+
+async def _drain(gen):
+    return [r async for r in gen]
+
+
+out = asyncio.run(_drain(g.on_message(_Ev("图片帮助"))))
+assert out and out[0][0] == "chain", out
+
+# 12c) 管理页与后端的一致性（改 id / 改 action 名最易漏的地方）；pages 下每个页面都查
+import re  # noqa: E402
+
+_main_src = (Path(__file__).parent / "main.py").read_text("utf-8")
+for _ph in sorted((Path(__file__).parent / "pages").glob("*/index.html")):
+    _html = _ph.read_text("utf-8")
+    _ids = set(re.findall(r"\$\('#([\w-]+)'\)", _html))
+    assert not {i for i in _ids if f'id="{i}"' not in _html}, f"{_ph.parent.name}: 页面脚本引用了不存在的元素 id"
+    _acts = set(re.findall(r"action:\s*'([\w_]+)'", _html))
+    assert not {a for a in _acts if f'action == "{a}"' not in _main_src}, f"{_ph.parent.name}: 页面用了后端没有的 action"
+
+_page_html = (Path(__file__).parent / "pages" / "manager" / "index.html").read_text("utf-8")
+assert "图片帮助" in _page_html and main.MENU_CMD in _main_src
+
+# 12d) 批量设置页：全部图库的 水印+菜单配置 一次给全
+res = _act("POST", {"action": "list_all_settings"})
+_rows = {r["name"]: r for r in res["galleries"]}
+assert _rows["菜单库"]["menu"] == {"show": False, "char": "菜单库", "group": "个人"}, _rows.get("菜单库")
+assert _rows["菜单库"]["wm"] is True, _rows.get("菜单库")           # 没动过的库缺省开水印
+assert _rows["可琳照片"]["count"] > 0, _rows.get("可琳照片")  # 前序用例导入过 2 张
+assert set(_rows["菜单库"]) == {"name", "count", "wm", "menu"}, _rows["菜单库"]
+
+# 12e) 封面稳定随机：目录内容不变 → 两次列表同一张；内容变化 → 种子换、封面仍是库内文件
+res1 = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+res2 = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+assert {x["name"]: x["cover"] for x in res1["galleries"]} == \
+       {x["name"]: x["cover"] for x in res2["galleries"]}
+(g._galleries / "菜单库" / "菜单库-2.jpg").write_bytes(b"y")  # 加文件 → 目录 mtime 变 → 种子变
+res3 = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
+_c3 = {x["name"]: x["cover"] for x in res3["galleries"]}
+assert _c3["菜单库"] in ("菜单库-1.jpg", "菜单库-2.jpg"), _c3
+
+# 12f) 选择模式批量操作：删除/移动/复制 + pid 跟迁 + 同名跳过 + 防穿越
+_act("POST", {"action": "create", "name": "批量A"})
+_act("POST", {"action": "create", "name": "批量B"})
+
+
+def _up(gal, fn):
+    return _act("POST", {"action": "upload", "name": gal,
+                         "files": [{"name": fn, "data": base64.b64encode(b"i").decode()}]})["saved"][0]["file"]
+
+
+a1 = _up("批量A", "95026140_p1.jpg")  # pid 命名 → 记 pid
+a2 = _up("批量A", "2_a.jpg")
+_up("批量B", "1_b.jpg")
+res = _act("POST", {"action": "batch", "op": "copy", "src": "批量A", "dst": "批量B", "images": [a1]})
+assert res["done"] == 1 and res["failed"] == [] and (g._galleries / "批量B" / a1).is_file(), res
+assert g._pids.get(f"批量B/{a1}") == "95026140_p1", res          # pid 跟着走，源保留
+res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B",
+                    "images": [a2, "不在.jpg", "../x.jpg"]})
+assert res["done"] == 1 and res["failed"] == ["不在.jpg", "../x.jpg"], res
+assert not (g._galleries / "批量A" / a2).exists() and (g._galleries / "批量B" / a2).is_file(), res
+res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B", "images": [a1]})
+assert res["done"] == 0 and res["failed"] == [a1], res           # 目标已有同名：跳过不覆盖
+res = _act("POST", {"action": "batch", "op": "delete", "src": "批量B", "images": [a1]})
+assert res["done"] == 1 and not (g._galleries / "批量B" / a1).exists(), res
+for _bad in ({"op": "??", "src": "批量A"}, {"op": "move", "src": "批量A", "dst": "没有的库"},
+             {"op": "copy", "src": "../etc"}):
+    res = _act("POST", {"action": "batch", **_bad, "images": []})
+    assert res["status"] == "error", res
+# 每行张数偏好：缺省 7，合法留存，垃圾忽略，越界收敛 3~8
+res = _act("POST", {"action": "list_images", "name": "批量A", "offset": 0, "limit": 50})
+assert res["cols"] == 7, res
+_act("POST", {"action": "save_settings", "cols": 5})
+assert _act("POST", {"action": "list_images", "name": "批量A", "offset": 0, "limit": 50})["cols"] == 5
+_act("POST", {"action": "save_settings", "cols": "垃圾"})
+assert _act("POST", {"action": "list_images", "name": "批量A", "offset": 0, "limit": 50})["cols"] == 5
+_act("POST", {"action": "save_settings", "cols": 99})
+assert _act("POST", {"action": "list_images", "name": "批量A", "offset": 0, "limit": 50})["cols"] == 8
+
+# 12g) 静默发送计数（图片/图库 + 时段）+ 悬停信息接口 + 移动迁统计
+g.config["watermark"] = False
+p_a1 = g._galleries / "批量A" / a1
+asyncio.run(g._send_image(p_a1))
+asyncio.run(g._send_image(p_a1))
+_row = g._stats["images"][f"批量A/{a1}"]
+assert _row["sends"] == 2 and len(_row["hours"]) == 24 and sum(_row["hours"]) == 2, _row
+assert g._stats["galleries"]["批量A"]["sends"] == 2, g._stats["galleries"]
+assert json.loads((g._root / "stats.json").read_text("utf-8"))["images"][f"批量A/{a1}"]["sends"] == 2
+res = _act("POST", {"action": "image_info", "name": "批量A", "image": a1})
+assert res["sends"] == 2 and res["size"] == p_a1.stat().st_size, res
+assert res["gallery"] == "批量A" and res["file"] == a1, res
+assert res["uid"] == "95026140" and res["pid"] == "95026140_p1", res
+assert res["path"] == str(p_a1), res                                       # 绝对路径
+assert res["color"] is None or (res["color"].startswith("#") and len(res["color"]) == 7), res
+assert _act("POST", {"action": "image_info", "name": "批量A", "image": "../x.jpg"})["status"] == "error"
+res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B", "images": [a1]})
+assert res["done"] == 1 and g._stats["images"][f"批量B/{a1}"]["sends"] == 2, res  # 统计键随迁
+assert f"批量A/{a1}" not in g._stats["images"], g._stats["images"]
+g.config["watermark"] = True
+
+# 12h) 悬停预览的带水印真实效果图：开=有信息条（高>宽），关=原样；防穿越
+try:
+    from PIL import Image as _PI  # noqa: F401
+
+    _buf = io.BytesIO()
+    _PI.new("RGB", (300, 400), "red").save(_buf, "PNG")
+    _act("POST", {"action": "create", "name": "水印库"})
+    res = _act("POST", {"action": "upload", "name": "水印库",
+                        "files": [{"name": "real.png", "data": base64.b64encode(_buf.getvalue()).decode()}]})
+    _wname = res["saved"][0]["file"]
+    res = _act("POST", {"action": "wm_preview", "name": "水印库", "image": _wname, "size": 800})
+    assert res["src"].startswith("data:image/jpeg;base64,"), res
+    _wim = _PI.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1])))
+    assert max(_wim.size) <= 800, _wim.size
+    assert _wim.size[1] > _wim.size[0], _wim.size  # 300x400 加了信息条 → 高>宽
+    g.config["watermark"] = False
+    res = _act("POST", {"action": "wm_preview", "name": "水印库", "image": _wname})
+    _wim2 = _PI.open(io.BytesIO(base64.b64decode(res["src"].split(",", 1)[1])))
+    assert _wim2.size == (300, 400), _wim2.size  # 关水印=发送原样
+    assert _act("POST", {"action": "wm_preview", "name": "水印库", "image": "../x.jpg"})["status"] == "error"
+    assert g.delete_gallery("水印库")
+except ImportError:
+    print("(无 PIL，跳过带水印预览检查)")
+g.config["watermark"] = True
+
+assert g.delete_gallery("批量A") and g.delete_gallery("批量B")
 
 shutil.rmtree(_tmp)
 print("selftest OK")

@@ -9,6 +9,9 @@
   是否加水印可按图库单独关闭（缺省开）
 - 原插件指令回归：收集（引用消息入库）/ 查看图片 / 删除图片指令，走 AstrBot 命令系统需命令前缀；
   而群里发关键词随机取图仍然不需要任何前缀
+- 图库菜单：群里发「图片帮助」得到一张汇总所有图库的菜单图（分区/字母分组/条目=角色名-关键词），
+  顶部背景图与各部件字体可在 WebUI「菜单预览」页里改（所见即所得）；每个图库可单独设置
+  是否进菜单 / 角色名称 / 所属分组（个人/团体/功能）
 - WebUI 为 AstrBot 插件 Pages（仪表盘内管理页），后端 API 经 context.register_web_api 注册
 - 二维码生成内嵌 segno（BSD-3-Clause，https://github.com/heuer/segno，见 _segno/LICENSE）
 - 全部数据按 AstrBot 规范存放在 data/plugin_data/astrbot_plugin_image_reply_plus/
@@ -25,6 +28,7 @@ import os
 import random
 import re
 import shutil
+import time
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -77,7 +81,7 @@ except ImportError:
             return {"status": "error", "message": message, "data": data or {}}
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
-PLUGIN_VERSION = "0.1.5"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PLUGIN_VERSION = "0.2.0"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
 PLUGIN_AUTHOR = "Haoxiang-Fant"  # 同上：@register 与 metadata.yaml 的 author 都用它
 PLUGIN_REPO = "https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus"
 PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
@@ -123,8 +127,8 @@ _PY_RANGE = (
 )
 
 
-def pinyin_key(name: str):
-    """图库排序键：逐字取拼音首字母（首字母相同自然比到第二个字），非汉字用原字符小写。"""
+def _gbk_pinyin_key(name: str):
+    """pypinyin 没装时的退路：GBK 区间法取拼音首字母（GB2312 一级字准，生僻字会归错）。"""
     key = []
     for ch in name or "":
         c = ch.lower()
@@ -147,6 +151,31 @@ def pinyin_key(name: str):
                 break
         key.append(c)
     return tuple(key)
+
+
+def pinyin_key(name: str):
+    """图库排序键：逐音节取小写拼音。装了 pypinyin（requirements 自带）生僻字也准；
+    没装退回 GBK 区间近似（多音字/生僻字可能归错，见 _gbk_pinyin_key）。"""
+    try:
+        from pypinyin import lazy_pinyin
+    except ImportError:
+        return _gbk_pinyin_key(name)
+    key = []
+    for syll in lazy_pinyin(name or ""):
+        key.extend(syll.lower())
+    return tuple(key)
+
+
+def _stable_cover(kw: str, d: Path, names: List[str]) -> Optional[str]:
+    """封面稳定随机：种子 = 图库名 + 目录 mtime。
+
+    目录内容不变（增删/改名都会动 mtime）→ 每次列表取到同一张，前端缓存不失效；
+    内容一变 → 自然换种子，重新随机一次。零存储、零失效钩子。
+    """
+    if not names:
+        return None
+    return random.Random(f"{kw}:{int(d.stat().st_mtime)}").choice(names)
+
 FONT_CANDIDATES = (
     "simhei.ttf", "msyh.ttc", "simsun.ttc",
     "notosanscjk-regular.ttc", "notosanssc-regular.otf", "wqy-microhei.ttc", "pingfang.ttc",
@@ -179,6 +208,90 @@ WM_FALLBACK_COLOR = (103, 141, 134)  # 样图占位主色，提取不到饱和�
 # 中日韩字符段（含全角标点/全角字母）→ 用中文字体绘制，其余交给西文字体
 CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]+")
 
+# ---------------- 图库菜单设计常量（0.2.0）----------------
+# 下面所有数字都是参考样图上的实测像素（样图宽 MENU_REF_W），渲染时统一乘 宽度/MENU_REF_W；
+# 改版式只改这里的比例，别在渲染函数里写死像素。
+MENU_CMD = "图片帮助"                 # 群里触发菜单的指令名
+MENU_REF_W = 1752.0                   # 参考样图宽度（测量基准）
+MENU_WIDTH = 1200                     # 发送用菜单图宽度
+MENU_PREVIEW_W = 700                  # WebUI 预览宽度（小图省带宽，版式按比例一致）
+MENU_BG_COLOR = (255, 251, 239)       # 正文底色（米白）
+MENU_RED = (191, 0, 1)                # 主题红（标题块/分区条/右上标签条）
+MENU_FG = (30, 30, 30)                # 正文文字
+MENU_DIM = (205, 205, 205)            # 右上信息框第一行（浅灰）
+MENU_HEADER_H = 303                   # 页眉高
+MENU_TITLE_BOX = (66, 0, 327, 152)    # 标题红块 x,y,w,h
+MENU_TITLE_XY = (89, 72)              # 标题文字墨迹左上角
+MENU_SUB_XY = (84, 159)               # 副标题第一行墨迹左上角
+MENU_SUB_PITCH = 30.5                 # 副标题行距
+MENU_META_BOX = (1350, 76, 234, 96)   # 右上信息框 x,y,w,h
+MENU_META_XY = (1369, 87)             # 信息框第一行墨迹左上角
+MENU_META_PITCH = 26.5                # 信息框行距
+MENU_LABEL_BAR = (1349, 256, 282, 46) # 右上红标签条 x,y,w,h
+MENU_SEC_BAR_X = 88                   # 分区条左边距
+MENU_SEC_BAR_H = 47                   # 分区条高
+MENU_SEC_BAR_PAD = 17                 # 分区条左右内边距
+MENU_COL_X = (123, 718, 1271)         # 三列文字左边（条目）
+MENU_COL_NUM_OFF = 12                 # 字母标签比条目更靠左的量
+MENU_LETTER_BG = (255, 176, 176)      # 字母标签底下的淡红高亮条（参考图每个字母都垫一条）
+MENU_LETTER_W = 24                    # 高亮条宽（固定宽，以字母墨迹中心居中）
+MENU_LETTER_H = 8                     # 高亮条高
+MENU_LINE_PITCH = 34                  # 正文行距
+MENU_GAP_BODY = 26                    # 页眉底/上一分区 → 分区条
+MENU_GAP_SEC = 27                     # 分区条 → 第一行文字
+MENU_GAP_GROUP = 8                    # 字母组之间的额外间距
+MENU_GAP_FOOTER = 67                  # 正文末行 → 页脚
+MENU_FOOTER_BAR = (24, 7, 13, 40)     # 页脚左侧红竖条 x,w,y偏移,h
+MENU_FOOTER_TX = 40                   # 页脚左栏文字左边
+MENU_FOOTER_PITCH = 25                # 页脚行距
+MENU_FOOTER_BG = (255, 255, 255)      # 页脚条带底色（纯白，和正文米白做区别）
+MENU_FOOTER_BG_PAD = 18               # 白条上沿高出页脚首行墨迹顶的量
+MENU_NOTE_X = 1298                    # 右下备注左边
+MENU_NOTE_DY = 12                     # 备注首行相对页脚首行的下移
+MENU_NOTE_PITCH = 24
+MENU_FOOTER_PAD = 25                  # 页脚底 → 图片底边
+MENU_FONT_SIZE = {                    # 各部件字号（参考样图像素）
+    "title": 52, "subtitle": 25, "meta1": 22, "meta2": 28, "meta3": 25,
+    "section": 34, "item": 28, "letter": 26, "label": 24, "footer": 22, "footnote": 22,
+}
+MENU_GROUPS = (("个人", "单人"), ("团体", "合照"), ("功能", "功能"))  # 配置值 → 分区标题
+MENU_GROUP_NAMES = tuple(g for g, _t in MENU_GROUPS)
+MENU_COLS = 3                          # 个人/团体 两区的列数
+MENU_PARTS = (                         # WebUI 可分别选字体/字号的部件
+    ("title", "标题"), ("subtitle", "副标题"), ("meta", "右上信息"),
+    ("section", "分区标题"), ("letter", "首字母"), ("item", "图库条目"), ("footer", "底部信息"),
+)
+MENU_SCRIPTS = (                       # 每个部件再按文字系统分三套字体
+    ("cjk", "中文"), ("latin", "英文/数字"), ("jp", "日文"),
+)
+# 菜单一行字的三段切分：假名→日文字体槽，其余 CJK/全角→中文字体槽，其余（数字/半角标点等）→西文字体槽
+MENU_RUN_RE = re.compile(
+    r"(?P<jp>[\u3041-\u30ff\u31f0-\u31ff\uff66-\uff9f]+)"
+    r"|(?P<cjk>[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]+)"
+    r"|(?P<latin>[^\u3041-\u30ff\u31f0-\u31ff\uff66-\uff9f\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]+)"
+)
+MENU_TEXT_KEYS = ("title", "subtitle", "label", "footer", "note")
+MENU_TEXT_DEFAULT = {
+    "title": MENU_CMD,
+    "subtitle": "如果展示的图片涉嫌侵权，请及时联系管理员\n发送指令可以随机获得对应角色的图片\n图源-pixiv",
+    "label": "人物名称-对应指令",
+    "footer": "基于AstrBot插件图库plus实现",
+    "note": "需要添加新的关键词请联系管理员",
+}
+MENU_TEXT_MAX = 400                    # 信任边界：单条菜单文字上限（防一次粘贴把图撑爆）
+MENU_MAX_LINES = 6                     # 多行文字最多渲染几行
+MENU_BG_MAX_MB = 10                    # 顶部背景图大小上限
+MENU_BG_NAME = "menu_bg"               # 背景图文件名前缀（存插件数据目录根）
+MENU_SIZE_MIN, MENU_SIZE_MAX = 50, 200  # 各部件字号的缩放百分比上下限（100 = 参考样式实测值）
+
+
+def _menu_size_pct(value) -> int:
+    """字号百分比：非数字/越界一律收敛（显示旋钮，不是安全边界，收紧点没坏处）。"""
+    try:
+        return min(max(int(value), MENU_SIZE_MIN), MENU_SIZE_MAX)
+    except (TypeError, ValueError):
+        return 100
+
 
 @register(
     PLUGIN_NAME,
@@ -196,16 +309,19 @@ class GalleryPlus(Star):
         except TypeError:  # ponytail: 旧版 StarTools 若无参签名，退回全局数据目录
             root = Path(StarTools.get_data_dir()) / PLUGIN_NAME
         # data/plugin_data/astrbot_plugin_image_reply_plus/
+        self._root = root
         self._galleries = root / "galleries"  # 每个关键词一个文件夹
         self._pid_file = root / "pids.json"   # {"关键词/文件名": "pid"}
         self._tmp = root / "temp"             # 发送用水印临时文件
         self._settings_file = root / "settings.json"  # 水印字体等 WebUI 设置
+        self._stats_file = root / "stats.json"  # 发送计数（静默，供后期数据面板）
         self._fonts_dir = root / "fonts"      # 管理员上传的字体文件池
         self._galleries.mkdir(parents=True, exist_ok=True)
         self._tmp.mkdir(parents=True, exist_ok=True)
         self._fonts_dir.mkdir(parents=True, exist_ok=True)
         self._pids: Dict[str, str] = self._load_pids()
         self._settings: Dict[str, Any] = self._load_settings()
+        self._stats: Dict[str, Any] = self._load_stats()
         # ponytail: 入库全局锁（并行上传时"算编号+写盘"必须原子，否则同名互覆）；瓶颈出现再拆图库级锁
         self._save_lock = asyncio.Lock()
         self._register_page_apis()
@@ -221,6 +337,9 @@ class GalleryPlus(Star):
                 return
             msg = (event.message_str or "").strip()
             if not msg:
+                return
+            if msg == MENU_CMD:  # 菜单：裸发「图片帮助」也出图（下面 @filter.command 是带前缀那条路）
+                yield await self._menu_result(event)
                 return
             names = {d.name for d in self._galleries.iterdir() if d.is_dir()}
             if not names:
@@ -258,6 +377,18 @@ class GalleryPlus(Star):
         yield event.plain_result(
             f"已收集 {len(saved)} 张图片进图库「{kw}」：{'、'.join(saved)}"
         )
+
+    @filter.command(MENU_CMD)
+    async def cmd_menu(self, event: AstrMessageEvent):
+        """图片帮助：发一张汇总所有图库的菜单图（内容/字体/背景在 WebUI「菜单预览」里配）。"""
+        yield await self._menu_result(event)
+
+    async def _menu_result(self, event):
+        """菜单图的两种返回（出图失败退化成一句提示，别把整个事件打挂）。"""
+        path = await asyncio.to_thread(self._render_menu)
+        if path is None:
+            return event.plain_result("菜单生成失败：请确认已安装 Pillow。")
+        return event.chain_result([Image.fromFileSystem(str(path))])
 
     @filter.command("查看图片")
     async def cmd_view(self, event: AstrMessageEvent):
@@ -301,6 +432,7 @@ class GalleryPlus(Star):
 
     async def _send_image(self, path: Path):
         """发送一张图库图片，按全局开关与该图库开关决定是否附加信息条。"""
+        self._count_send(path.parent.name, path.name)  # 静默计数：图片与图库各一次
         if self.config.get("watermark", True) and self._gallery_wm(path.parent.name):
             path = await asyncio.to_thread(self._render_watermark, path)
         return Image.fromFileSystem(str(path))
@@ -419,6 +551,31 @@ class GalleryPlus(Star):
         self._pid_file.write_text(
             json.dumps(self._pids, ensure_ascii=False, indent=2), "utf-8"
         )
+
+    def _load_stats(self) -> Dict[str, Any]:
+        try:
+            data = json.loads(self._stats_file.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _count_send(self, kw: str, file: str) -> None:
+        """静默发送计数：图片/图库各 +1，并记 24 小时时段分布（stats.json，暂无界面）。"""
+        hour = time.localtime().tm_hour
+        for table, key in (
+            (self._stats.setdefault("images", {}), f"{kw}/{file}"),
+            (self._stats.setdefault("galleries", {}), kw),
+        ):
+            row = table.setdefault(key, {"sends": 0, "hours": [0] * 24})
+            row["sends"] += 1
+            row["hours"][hour] += 1
+        try:
+            self._save_stats()
+        except OSError:
+            pass  # ponytail: 每次发送全量落盘，bot 量级无碍；高频了再改防抖/追加日志
+
+    def _save_stats(self) -> None:
+        self._stats_file.write_text(json.dumps(self._stats, ensure_ascii=False), "utf-8")
 
     @staticmethod
     def _safe_kw(kw: str) -> str:
@@ -553,6 +710,9 @@ class GalleryPlus(Star):
         if isinstance(self._settings.get("gallery_wm"), dict):  # 库没了，水印开关一并清掉
             self._settings["gallery_wm"].pop(d.name, None)
             self._save_settings()
+        if isinstance(self._settings.get("gallery_menu"), dict):  # 菜单配置同理，别留脏键
+            self._settings["gallery_menu"].pop(d.name, None)
+            self._save_settings()
         return True
 
     def list_galleries(self) -> List[dict]:
@@ -569,7 +729,7 @@ class GalleryPlus(Star):
                     "name": d.name,
                     "count": len(names),
                     "wm": self._gallery_wm(d.name),
-                    "cover": random.choice(names) if names else None,
+                    "cover": _stable_cover(d.name, d, names),
                     "images": [
                         {"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in names
                     ],
@@ -593,7 +753,7 @@ class GalleryPlus(Star):
                     "name": name,
                     "count": len(files),
                     "wm": self._gallery_wm(name),
-                    "cover": random.choice(files) if files else None,
+                    "cover": _stable_cover(name, d, files),
                 }
             )
         return out, len(names)
@@ -611,6 +771,7 @@ class GalleryPlus(Star):
         return (
             [{"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in page],
             len(names),
+            self._settings.get("thumb_cols", 7),  # 顺带带回每行张数偏好，二级页开页即用
         )
 
     # ---------------- 水印 ----------------
@@ -810,6 +971,338 @@ class GalleryPlus(Star):
             img = self._line_image(text, size, f_cjk, f_lat)
         return img
 
+    # ---------------- 图库菜单（0.2.0）----------------
+
+    def _menu_settings(self) -> dict:
+        """settings.json 里的 menu 表（不是 dict 就地修正，省得各处判断）。"""
+        m = self._settings.get("menu")
+        if not isinstance(m, dict):
+            m = {}
+            self._settings["menu"] = m
+        return m
+
+    def _gallery_menu(self, kw: str) -> Dict[str, Any]:
+        """单图库的菜单配置。缺省：进菜单、角色名=关键词、分组=个人。"""
+        m = self._settings.get("gallery_menu")
+        row = m.get(kw) if isinstance(m, dict) else None
+        row = row if isinstance(row, dict) else {}
+        group = row.get("group") if row.get("group") in MENU_GROUP_NAMES else MENU_GROUP_NAMES[0]
+        return {
+            "show": bool(row.get("show", True)),
+            "char": str(row.get("char") or kw),
+            "group": group,
+        }
+
+    def set_gallery_menu(self, kw: str, show: bool, char: str, group: str) -> Dict[str, Any]:
+        if group not in MENU_GROUP_NAMES:  # 信任边界：分组只认三个枚举值
+            group = MENU_GROUP_NAMES[0]
+        table = self._settings.get("gallery_menu")
+        if not isinstance(table, dict):  # settings.json 被手改坏时也别炸
+            table = {}
+            self._settings["gallery_menu"] = table
+        table[kw] = {
+            "show": bool(show),
+            "char": (char or kw).strip()[:24] or kw,
+            "group": group,
+        }
+        self._save_settings()
+        return self._gallery_menu(kw)
+
+    def _menu_config(self) -> Dict[str, Any]:
+        """菜单文字 + 各部件字体（中/英/日三槽）/字号（缺项回落默认值）。"""
+        m = self._settings.get("menu")
+        m = m if isinstance(m, dict) else {}
+        fonts = m.get("fonts") if isinstance(m.get("fonts"), dict) else {}
+        sizes = m.get("sizes") if isinstance(m.get("sizes"), dict) else {}
+        out: Dict[str, Any] = {k: str(m.get(k) or MENU_TEXT_DEFAULT[k]) for k in MENU_TEXT_KEYS}
+
+        def slots(v) -> Dict[str, str]:
+            if isinstance(v, dict):  # 新格式 {"cjk":…,"latin":…,"jp":…}
+                return {s: str(v.get(s) or DEFAULT_CJK_FONT) for s, _lbl in MENU_SCRIPTS}
+            name = str(v or DEFAULT_CJK_FONT)  # 旧格式（单个字体名）→ 三槽同字体
+            return {s: name for s, _lbl in MENU_SCRIPTS}
+
+        out["fonts"] = {p: slots(fonts.get(p)) for p, _lbl in MENU_PARTS}
+        out["sizes"] = {p: _menu_size_pct(sizes.get(p)) for p, _lbl in MENU_PARTS}
+        return out
+
+    def _menu_bg_path(self) -> Optional[Path]:
+        """管理员上传的页眉背景图（settings 里只存文件名，防路径穿越）。"""
+        m = self._settings.get("menu")
+        name = str((m or {}).get("bg") or "") if isinstance(m, dict) else ""
+        if not name or Path(name).name != name:
+            return None
+        p = self._root / name
+        return p if p.is_file() else None
+
+    def set_menu_bg(self, data: bytes, ext: str) -> str:
+        """保存页眉背景图：同名旧图先删（只留一张），文件名固定前缀 + 扩展名。"""
+        for old in self._root.glob(f"{MENU_BG_NAME}.*"):
+            old.unlink(missing_ok=True)
+        target = self._root / f"{MENU_BG_NAME}{ext}"
+        target.write_bytes(data)
+        self._menu_settings()["bg"] = target.name
+        self._save_settings()
+        return target.name
+
+    def _menu_data(self) -> Dict[str, List[tuple]]:
+        """按分区列出进菜单的 (角色名, 关键词)，分区内按拼音排序。"""
+        out: Dict[str, List[tuple]] = {g: [] for g in MENU_GROUP_NAMES}
+        for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
+            if not d.is_dir():
+                continue
+            m = self._gallery_menu(d.name)
+            if m["show"]:
+                out.setdefault(m["group"], []).append((m["char"], d.name))
+        for rows in out.values():
+            rows.sort(key=lambda ck: (pinyin_key(ck[0]), pinyin_key(ck[1])))
+        return out
+
+    def _menu_stats(self):
+        """(图片总数, 最后上传时间戳)；无图时时间戳为 0。"""
+        total, newest = 0, 0.0
+        for d in self._galleries.iterdir():
+            if not d.is_dir():
+                continue
+            for p in d.iterdir():
+                if p.is_file() and p.suffix.lower() in EXTS:
+                    total += 1
+                    newest = max(newest, p.stat().st_mtime)
+        return total, newest
+
+    @staticmethod
+    def _letter_of(name: str) -> str:
+        """角色的字母标签：拼音首字母大写；取不到字母的归到 "#"。"""
+        k = pinyin_key(name)
+        c = k[0] if k else "#"
+        return c.upper() if c.isalpha() else "#"
+
+    @staticmethod
+    def _menu_columns(groups, n: int = MENU_COLS):
+        """字母组按行数均衡切成 n 列（贪心：攒够 总行数/n 换列），保持字母顺序。"""
+        if not groups:
+            return []
+        # 每组的行数 = 字母行 + 条目行 + 组间距；总高除以列数就是每列的目标行数
+        per = sum(len(e) + 2 for _l, e in groups) / n
+        cols, cur, h = [], [], 0
+        for g in groups:
+            cur.append(g)
+            h += len(g[1]) + 2
+            if len(cols) < n - 1 and h >= per:
+                cols.append(cur)
+                cur, h = [], 0
+        cols.append(cur)
+        return [c for c in cols if c]
+
+    def _render_menu(self, width: Optional[int] = None) -> Optional[Path]:
+        """渲染图库菜单图：版式按参考样图复刻，全部尺寸随宽度等比缩放。返回文件路径。"""
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            logger.warning("未安装 Pillow，图库菜单不可用")
+            return None
+        try:
+            W = min(max(int(width or MENU_WIDTH), 400), 2000)
+            u = W / MENU_REF_W
+            P = lambda v: int(round(v * u))  # noqa: E731  参考样图像素 → 输出像素
+            cfg = self._menu_config()
+            fdir = str(self._fonts_dir)
+
+            def f(part: str, size: int) -> Dict[str, Any]:
+                """部件在该参考字号（×百分比）下的 中/英/日 三套字体。"""
+                size = max(round(size * cfg["sizes"].get(part, 100) / 100), 6)
+                slots = cfg["fonts"][part]
+                return {s: _resolve_font(slots[s], size, fdir) for s, _lbl in MENU_SCRIPTS}
+
+            def fit(text: str, part: str, size: int, max_w: int, color=MENU_FG):
+                """按可用宽度逐级缩字号（菜单文字可配置，防溢出）。返回墨迹条带图。"""
+                while size > 8:
+                    strip = _menu_line(text, f(part, P(size)), color)
+                    if strip.width <= max_w:
+                        return strip
+                    size -= 2
+                return _menu_line(text, f(part, P(size)), color)
+
+            # ---- 内容 ----
+            data = self._menu_data()
+            total, newest = self._menu_stats()
+            import datetime as _dt
+
+            up = _dt.datetime.fromtimestamp(newest) if newest else _dt.datetime.now()
+            meta = (
+                ("图库更新日期", "meta1", MENU_DIM),
+                (f"CST {up.year:04d}/{up.month:02d}/{up.day:02d}", "meta2", (255, 255, 255)),
+                (f"总 {total:,}张", "meta3", (255, 255, 255)),
+            )
+            now = _dt.datetime.now()
+            subtitle = [ln.strip() for ln in cfg["subtitle"].splitlines() if ln.strip()][:MENU_MAX_LINES]
+            note = [ln.strip() for ln in cfg["note"].splitlines() if ln.strip()][:MENU_MAX_LINES]
+            foot = (
+                cfg["footer"].strip() or MENU_TEXT_DEFAULT["footer"],
+                f"生成时间 中国标准时间(CST) {now.year}/{now.month}/{now.day} {now:%H:%M}",
+            )
+
+            # ---- 先排正文算总高（y 全部用参考像素，最后一起缩放）----
+            ops: List[tuple] = []  # (kind, text, x_ref, y_ref)
+            y = MENU_HEADER_H
+            for gname, sec_title in MENU_GROUPS:
+                rows = data.get(gname) or []
+                if not rows:
+                    continue
+                y += MENU_GAP_BODY
+                ops.append(("section", sec_title, MENU_SEC_BAR_X, y))
+                cursor = y + MENU_SEC_BAR_H + MENU_GAP_SEC
+                if gname == MENU_GROUPS[-1][0]:  # 功能分区不按字母分组，单列
+                    for char, kw in rows:
+                        ops.append(("item", f"{char}-{kw}", MENU_COL_X[0], cursor))
+                        cursor += MENU_LINE_PITCH
+                else:
+                    groups: List[tuple] = []
+                    for char, kw in rows:  # rows 已排序 → 同字母天然相邻
+                        lt = self._letter_of(char)
+                        if not groups or groups[-1][0] != lt:
+                            groups.append((lt, []))
+                        groups[-1][1].append((char, kw))
+                    top = cursor  # 各列都从分区正文首行开始（cursor 是"本区已用最大高度"）
+                    for ci, col in enumerate(self._menu_columns(groups)):
+                        cy = top
+                        for lt, entries in col:
+                            ops.append(("letter", lt, MENU_COL_X[ci] - MENU_COL_NUM_OFF, cy))
+                            cy += MENU_LINE_PITCH
+                            for char, kw in entries:
+                                ops.append(("item", f"{char}-{kw}", MENU_COL_X[ci], cy))
+                                cy += MENU_LINE_PITCH
+                            cy += MENU_GAP_GROUP
+                        cursor = max(cursor, cy)
+                y = cursor
+            footer_y = y + MENU_GAP_FOOTER
+            H = P(footer_y + MENU_FOOTER_PITCH + MENU_FONT_SIZE["footnote"] + MENU_FOOTER_PAD)
+
+            # ---- 画 ----
+            canvas = Image.new("RGB", (W, H), MENU_BG_COLOR)
+            d = ImageDraw.Draw(canvas)
+            hh = P(MENU_HEADER_H)
+            bg = self._load_menu_bg()
+            # ponytail: 背景图不加压暗蒙版（样图也没有）；白字看不清就换张深色背景图
+            canvas.paste(_cover_crop(bg, W, hh) if bg is not None else _menu_default_bg(W, hh), (0, 0))
+
+            tb = MENU_TITLE_BOX  # 标题红块 + 白色标题（超宽逐级缩字号）
+            d.rectangle((P(tb[0]), P(tb[1]), P(tb[0] + tb[2]) - 1, P(tb[1] + tb[3]) - 1), fill=MENU_RED)
+            title = cfg["title"].strip() or MENU_TEXT_DEFAULT["title"]
+            tf = fit(title, "title", MENU_FONT_SIZE["title"], P(tb[2] - 46), (255, 255, 255))
+            canvas.paste(tf, (P(MENU_TITLE_XY[0]), P(MENU_TITLE_XY[1])), tf)
+
+            for i, ln in enumerate(subtitle):
+                sf = _menu_line(ln, f("subtitle", P(MENU_FONT_SIZE["subtitle"])), (255, 255, 255))
+                canvas.paste(sf, (P(MENU_SUB_XY[0]), P(MENU_SUB_XY[1] + i * MENU_SUB_PITCH)), sf)
+
+            mb = MENU_META_BOX  # 右上信息框：半透明暗底 + 浅色细框 + 三行
+            box = Image.new("RGBA", (P(mb[2]), P(mb[3])), (18, 14, 15, 150))
+            ImageDraw.Draw(box).rectangle(
+                (0, 0, box.width - 1, box.height - 1), outline=(210, 210, 210, 220), width=1
+            )
+            canvas.paste(box, (P(mb[0]), P(mb[1])), box)
+            meta_max_w = P(mb[2] - 2 * (MENU_META_XY[0] - mb[0]))
+            for i, (txt, key, color) in enumerate(meta):
+                mf = fit(txt, "meta", MENU_FONT_SIZE[key], meta_max_w, color)
+                canvas.paste(mf, (P(MENU_META_XY[0]), P(MENU_META_XY[1] + i * MENU_META_PITCH)), mf)
+
+            lb = MENU_LABEL_BAR  # 右上红标签条（居中白字）
+            d.rectangle((P(lb[0]), P(lb[1]), P(lb[0] + lb[2]) - 1, P(lb[1] + lb[3]) - 1), fill=MENU_RED)
+            ltext = cfg["label"].strip() or MENU_TEXT_DEFAULT["label"]
+            lf = fit(ltext, "section", MENU_FONT_SIZE["label"], P(lb[2] - 20), (255, 255, 255))
+            canvas.paste(lf, (P(lb[0]) + (P(lb[2]) - lf.width) // 2,
+                              P(lb[1]) + (P(lb[3]) - lf.height) // 2), lf)
+
+            for kind, text, x, yr in ops:
+                if kind == "section":
+                    st = _menu_line(text, f("section", P(MENU_FONT_SIZE["section"])), (255, 255, 255))
+                    bw = st.width + P(2 * MENU_SEC_BAR_PAD)
+                    d.rectangle((P(x), P(yr), P(x) + bw - 1, P(yr + MENU_SEC_BAR_H) - 1), fill=MENU_RED)
+                    canvas.paste(st, (P(x) + P(MENU_SEC_BAR_PAD),
+                                      P(yr) + (P(MENU_SEC_BAR_H) - st.height) // 2), st)
+                elif kind == "letter":
+                    lt = _menu_line(text, f("letter", P(MENU_FONT_SIZE["letter"])))
+                    bx = P(x) + lt.width // 2 - P(MENU_LETTER_W) // 2  # 高亮条以字母墨迹中心居中
+                    by = P(yr) + lt.height // 2 - P(MENU_LETTER_H) // 2
+                    d.rectangle((bx, by, bx + P(MENU_LETTER_W) - 1, by + P(MENU_LETTER_H) - 1),
+                                fill=MENU_LETTER_BG)
+                    canvas.paste(lt, (P(x), P(yr)), lt)
+                else:
+                    it = fit(text, "item", MENU_FONT_SIZE["item"], P(MENU_COL_X[1] - MENU_COL_X[0] - 20))
+                    canvas.paste(it, (P(x), P(yr)), it)
+
+            # 页脚条带：纯白，和正文米白做区别（画在页脚文字之前，正文内容够不到这里）
+            d.rectangle((0, P(footer_y - MENU_FOOTER_BG_PAD), W, H - 1), fill=MENU_FOOTER_BG)
+
+            fb = MENU_FOOTER_BAR  # 页脚：左侧红竖条 + 两行说明；右下角备注
+            d.rectangle((P(fb[0]), P(int(footer_y) + fb[2]), P(fb[0] + fb[1]) - 1, P(int(footer_y) + fb[2] + fb[3]) - 1), fill=MENU_RED)
+            f1 = _menu_line(foot[0], f("footer", P(MENU_FONT_SIZE["footer"])))
+            canvas.paste(f1, (P(MENU_FOOTER_TX), P(footer_y)), f1)
+            f2 = _menu_line(foot[1], f("footer", P(MENU_FONT_SIZE["footnote"])))
+            canvas.paste(f2, (P(MENU_FOOTER_TX), P(footer_y + MENU_FOOTER_PITCH)), f2)
+            for i, ln in enumerate(note):
+                ns = _menu_line(ln, f("footer", P(MENU_FONT_SIZE["footnote"])))
+                canvas.paste(ns, (P(MENU_NOTE_X), P(footer_y + MENU_NOTE_DY + i * MENU_NOTE_PITCH)), ns)
+
+            out = self._tmp / f"menu_{W}.png"
+            canvas.save(out, "PNG")
+            return out
+        except Exception as e:
+            logger.error(f"图库菜单渲染失败: {e}", exc_info=True)
+            return None
+
+    def _render_menu_src(self, width: int) -> Optional[str]:
+        """菜单图 data URI（预览用）。键名必须是 src：bridge 会剥掉顶层 data 键。"""
+        p = self._render_menu(width)
+        if p is None:
+            return None
+        return "data:image/png;base64," + base64.b64encode(p.read_bytes()).decode()
+
+    def _menu_payload(self) -> Dict[str, Any]:
+        """菜单预览页要的全部数据（文字/字体/可用字体/预览图）。"""
+        cfg = self._menu_config()
+        return {
+            "texts": {k: cfg[k] for k in MENU_TEXT_KEYS},
+            "fonts": cfg["fonts"],
+            "sizes": cfg["sizes"],
+            "parts": [{"key": k, "label": lbl} for k, lbl in MENU_PARTS],
+            "available": sorted(_font_index(str(self._fonts_dir))),
+            "names": _font_display(str(self._fonts_dir)),  # 文件名 → 字体显示名（UI 显示/搜索用）
+            "bg": bool(self._menu_bg_path()),
+            "src": self._render_menu_src(MENU_PREVIEW_W),
+        }
+
+    def _load_menu_bg(self):
+        p = self._menu_bg_path()
+        if p is None:
+            return None
+        try:
+            from PIL import Image
+
+            return Image.open(p).convert("RGB")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _image_ext(data: bytes) -> Optional[str]:
+        """信任边界：PIL 验证字节确实是图片（且不是超大图），返回安全扩展名。"""
+        try:
+            from PIL import Image
+        except ImportError:
+            return None
+        try:
+            im = Image.open(io.BytesIO(data))
+            fmt, size = im.format, im.size
+            im.verify()
+            if size[0] * size[1] > 40_000_000:
+                return None
+            return {
+                "JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp", "BMP": ".bmp", "GIF": ".gif",
+            }.get(fmt or "")
+        except Exception:
+            return None
+
     # ---------------- WebUI（AstrBot 插件 Pages 后端）----------------
 
     def _thumb(self, kw: str, image: str, px: int = 240) -> Optional[Path]:
@@ -921,8 +1414,8 @@ class GalleryPlus(Star):
             if not self._kw_dir(kw):
                 return error_response("关键词不存在或非法", status_code=400)
             off, lim = self._page(payload)
-            imgs, total = self.list_images(kw, off, lim)
-            return json_response({"images": imgs, "total": total})
+            imgs, total, cols = self.list_images(kw, off, lim)
+            return json_response({"images": imgs, "total": total, "cols": cols})
 
         if action == "thumb":  # 缩略图（服务端生成缓存，避免整图 base64 过桥）；size 可选
             t = self._thumb(
@@ -1011,13 +1504,17 @@ class GalleryPlus(Star):
                 }
             )
 
-        if action == "save_settings":  # 保存水印字体设置（名称必须是可用的字体文件）
+        if action == "save_settings":  # 保存水印字体设置（名称必须是可用的字体文件）；顺带存每行张数偏好
             idx = _font_index(str(self._fonts_dir))
             for key, default in (("cjk", DEFAULT_CJK_FONT), ("latin", DEFAULT_LATIN_FONT)):
                 name = str(payload.get(key, "")).strip()
                 if name and name.lower() not in idx:
                     return error_response(f"系统中未找到字体文件: {name}", status_code=400)
                 self._settings[f"wm_font_{key}"] = name or default
+            try:  # 二级页每行张数（3~8），垃圾值忽略
+                self._settings["thumb_cols"] = min(max(int(payload.get("cols")), 3), 8)
+            except (TypeError, ValueError):
+                pass
             self._save_settings()
             return json_response({"ok": True})
 
@@ -1044,6 +1541,7 @@ class GalleryPlus(Star):
                 target.unlink(missing_ok=True)
                 return error_response("不是有效的字体文件", status_code=400)
             _font_index.cache_clear()  # 新字体进入索引
+            _font_display.cache_clear()
             return json_response({"ok": True, "name": fname})
 
         if action == "set_pid":  # 改/清单张图片的 PID（WebUI 悬停编辑）
@@ -1059,6 +1557,70 @@ class GalleryPlus(Star):
             self._save_pids()
             return json_response({"ok": True, "pid": pid or None})
 
+        if action == "wm_preview":  # 悬停预览：带发送时水印条的真实效果，等比缩到 size 内
+            d = self._kw_dir(str(payload.get("name", "")))
+            image = str(payload.get("image", ""))
+            if not d or Path(image).name != image:
+                return error_response("非法路径", status_code=400)
+            p = d / image
+            if not d.is_dir() or not p.is_file():
+                return error_response("图片不存在", status_code=404)
+            try:
+                px = min(max(int(payload.get("size") or 800), 80), 1600)
+            except (TypeError, ValueError):
+                px = 800
+            src = p
+            try:  # 与 _send_image 同一开关逻辑：全局/图库关了就是原样
+                if self.config.get("watermark", True) and self._gallery_wm(d.name):
+                    src = await asyncio.to_thread(self._render_watermark, p)
+            except Exception:
+                src = p
+            try:
+                from PIL import Image
+
+                with Image.open(src) as im:
+                    im.thumbnail((px, px))
+                    if im.mode not in ("RGB", "L"):
+                        im = im.convert("RGB")
+                    buf = io.BytesIO()
+                    im.save(buf, "JPEG", quality=85)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+            except Exception:  # 无 PIL：原样回（base64 直传）
+                b64 = base64.b64encode(src.read_bytes()).decode()
+            return json_response({"src": f"data:image/jpeg;base64,{b64}"})
+
+        if action == "image_info":  # 悬停预览卡：图库/文件名/大小/UID/发送次数/绝对路径/主色淡化底色
+            d = self._kw_dir(str(payload.get("name", "")))
+            image = str(payload.get("image", ""))
+            if not d or Path(image).name != image:
+                return error_response("非法路径", status_code=400)
+            p = d / image
+            if not d.is_dir() or not p.is_file():
+                return error_response("图片不存在", status_code=404)
+            row = self._stats.get("images", {}).get(f"{d.name}/{image}", {})
+            pid = self._pids.get(f"{d.name}/{image}") or ""
+            color = None
+            try:  # 主色提取（同水印条）后向白色淡化 90%，做悬停卡底色
+                from PIL import Image
+
+                with Image.open(p) as im:
+                    c = self._theme_color(im)
+                color = "#%02x%02x%02x" % tuple(round(v + (255 - v) * 0.9) for v in c)
+            except Exception:
+                pass  # 无 PIL/坏图：前端用默认底色
+            return json_response(
+                {
+                    "gallery": d.name,
+                    "file": image,
+                    "size": p.stat().st_size,
+                    "uid": pid.split("_", 1)[0],
+                    "pid": pid or None,
+                    "sends": row.get("sends", 0),
+                    "path": str(p),
+                    "color": color,
+                }
+            )
+
         if action == "set_wm":  # 单图库水印开关（缺省开）
             d = self._kw_dir(str(payload.get("name", "")))
             if not d or not d.is_dir():
@@ -1066,7 +1628,199 @@ class GalleryPlus(Star):
             self.set_gallery_wm(d.name, bool(payload.get("enabled", True)))
             return json_response({"ok": True, "wm": self._gallery_wm(d.name)})
 
+        if action == "get_menu":  # 菜单预览页：文字/字体/可用字体/预览图 一次给全
+            return json_response(self._menu_payload())
+
+        if action == "save_menu":  # 保存菜单文字/字体/字号，并把最新预览图一起返回（所见即所得）
+            texts = payload.get("texts")
+            if isinstance(texts, dict):
+                for k in MENU_TEXT_KEYS:
+                    if k in texts:
+                        self._menu_settings()[k] = str(texts[k])[:MENU_TEXT_MAX]
+            fonts = payload.get("fonts")
+            if isinstance(fonts, dict):
+                idx = _font_index(str(self._fonts_dir))
+                table = self._menu_settings().setdefault("fonts", {})
+                if not isinstance(table, dict):  # 手改坏的 settings 别炸
+                    table = {}
+                    self._menu_settings()["fonts"] = table
+                for part, _lbl in MENU_PARTS:
+                    slots = fonts.get(part)
+                    if not isinstance(slots, dict):
+                        continue
+                    cur = table.get(part)
+                    if not isinstance(cur, dict):  # 旧格式存单个字体名，第一次保存升级成三槽
+                        cur = {}
+                        table[part] = cur
+                    for script, _lbl in MENU_SCRIPTS:
+                        name = str(slots.get(script, "")).strip()
+                        if not name:
+                            continue
+                        if name.lower() not in idx:
+                            return error_response(f"系统中未找到字体文件: {name}", status_code=400)
+                        cur[script] = name
+            sizes = payload.get("sizes")
+            if isinstance(sizes, dict):  # 字号百分比：垃圾值在 _menu_size_pct 里收敛
+                store = self._menu_settings().setdefault("sizes", {})
+                for part, _lbl in MENU_PARTS:
+                    if part in sizes:
+                        store[part] = _menu_size_pct(sizes[part])
+            self._save_settings()
+            return json_response(self._menu_payload())
+
+        if action == "upload_menu_bg":  # 管理员自定义菜单页眉背景图
+            b64 = str(payload.get("data", ""))
+            if "," in b64:
+                b64 = b64.split(",", 1)[1]
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return error_response("内容解码失败", status_code=400)
+            if not data or len(data) > MENU_BG_MAX_MB * 1024 * 1024:
+                return error_response(f"背景图不能为空，且不超过 {MENU_BG_MAX_MB}MB", status_code=400)
+            ext = self._image_ext(data)
+            if ext is None:
+                return error_response("不是有效的图片文件", status_code=400)
+            self.set_menu_bg(data, ext)
+            return json_response({"ok": True, **self._menu_payload()})
+
+        if action == "get_gallery_menu":  # 单图库菜单配置（图库二级页的弹窗）
+            d = self._kw_dir(str(payload.get("name", "")))
+            if not d or not d.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            return json_response({"menu": self._gallery_menu(d.name)})
+
+        if action == "set_gallery_menu":
+            d = self._kw_dir(str(payload.get("name", "")))
+            if not d or not d.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            return json_response(
+                {
+                    "ok": True,
+                    "menu": self.set_gallery_menu(
+                        d.name,
+                        bool(payload.get("show", True)),
+                        str(payload.get("char", "")),
+                        str(payload.get("group", "")),
+                    ),
+                }
+            )
+
+        if action == "batch":  # 选择模式批量操作：删除 / 移动 / 复制（dst 仅 move/copy 需要）
+            src = self._kw_dir(str(payload.get("src", "")))
+            op = str(payload.get("op", ""))
+            if op not in ("delete", "move", "copy"):
+                return error_response("未知操作", status_code=400)
+            if not src or not src.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            dst = self._kw_dir(str(payload.get("dst", "")))
+            if op in ("move", "copy") and (not dst or not dst.is_dir()):
+                return error_response("目标图库不存在或非法", status_code=404)
+            done, failed = 0, []
+            for image in payload.get("images", []):
+                image = str(image)
+                p = src / image if Path(image).name == image else None  # 信任边界：只认裸文件名
+                if p is None or not p.is_file():
+                    failed.append(image)
+                    continue
+                try:
+                    if op == "delete":
+                        self.delete_image(src.name, image)
+                    elif op in ("move", "copy"):
+                        if (dst / image).exists():  # 同名不覆盖：跳过并上报
+                            failed.append(image)
+                            continue
+                        (shutil.move if op == "move" else shutil.copy2)(p, dst / image)
+                        pid = self._pids.get(f"{src.name}/{image}")
+                        if pid:
+                            self._pids[f"{dst.name}/{image}"] = pid
+                            if op == "move":
+                                self._pids.pop(f"{src.name}/{image}", None)
+                        if op == "move":  # 发送统计跟着文件走（复制是新文件、重新计数）
+                            row = self._stats.get("images", {}).pop(f"{src.name}/{image}", None)
+                            if row:
+                                self._stats.setdefault("images", {})[f"{dst.name}/{image}"] = row
+                    done += 1
+                except OSError:
+                    failed.append(image)
+            if op in ("move", "copy"):
+                self._save_pids()
+            if op == "move":
+                try:
+                    self._save_stats()
+                except OSError:
+                    pass
+            return json_response({"ok": True, "done": done, "failed": failed})
+
+        if action == "list_all_settings":  # 批量设置页：全部图库的 水印+菜单配置 一次给全
+            out = []
+            for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
+                if not d.is_dir():
+                    continue
+                # ponytail: 不分页（只读目录名+settings，不碰图片内容）；图库上几百个再翻页
+                n = sum(1 for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
+                out.append(
+                    {
+                        "name": d.name,
+                        "count": n,
+                        "wm": self._gallery_wm(d.name),
+                        "menu": self._gallery_menu(d.name),
+                    }
+                )
+            return json_response({"galleries": out})
+
         return error_response("未知操作", status_code=400)
+
+
+def _menu_line(text: str, fonts: Dict[str, Any], color=(0, 0, 0)):
+    """按 中/英/日 字体槽把一行字画成墨迹紧贴的透明条带（位置/居中/测宽全用这张图）。
+
+    runs：假名→'jp'，其余 CJK/全角→'cjk'，其余→'latin'（见 MENU_RUN_RE）。
+    """
+    from PIL import Image, ImageDraw
+
+    runs = [(m.group(), fonts.get(m.lastgroup)) for m in MENU_RUN_RE.finditer(text)]
+    runs = runs or [(text, fonts.get("latin"))]
+    used = []
+    for _t, fnt in runs:
+        if fnt is not None and fnt not in used:
+            used.append(fnt)
+    if not used:
+        used = [fonts.get("latin")]
+    asc = max(f.getmetrics()[0] for f in used)
+    desc = max(f.getmetrics()[1] for f in used)
+    img = Image.new("RGBA", (int(sum(f.getlength(t) for t, f in runs)) + 8, asc + desc + 8), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    x = 4.0
+    for t, fnt in runs:
+        d.text((x, asc), t, font=fnt, fill=tuple(color) + (255,), anchor="ls")  # 共用基线，混排才齐
+        x += fnt.getlength(t)
+    bb = img.getbbox()
+    return img.crop(bb) if bb else img
+
+
+def _cover_crop(im, w: int, h: int):
+    """等比放大到铺满 w×h 后居中裁剪（页眉背景图用）。"""
+    from PIL import Image
+
+    k = max(w / im.width, h / im.height)
+    big = im.resize(
+        (max(int(round(im.width * k)), w), max(int(round(im.height * k)), h)), Image.LANCZOS
+    )
+    x, y = (big.width - w) // 2, (big.height - h) // 2
+    return big.crop((x, y, x + w, y + h))
+
+
+def _menu_default_bg(w: int, h: int):
+    """没上传背景图时的默认页眉底：上暗下红的竖向渐变（保证白字可读）。"""
+    from PIL import Image
+
+    top, bottom = (32, 33, 38), (86, 20, 24)
+    grad = Image.new("RGB", (1, h))
+    for y in range(h):
+        k = y / max(h - 1, 1)
+        grad.putpixel((0, y), tuple(round(top[i] + (bottom[i] - top[i]) * k) for i in range(3)))
+    return grad.resize((w, h))
 
 
 @lru_cache(maxsize=None)
@@ -1088,6 +1842,23 @@ def _font_index(extra_dir: str = "") -> Dict[str, str]:
                     out[p.name.lower()] = str(p)  # 后扫描的目录覆盖前者（上传池优先）
         except OSError:
             continue
+    return out
+
+
+@lru_cache(maxsize=None)
+def _font_display(extra_dir: str = "") -> Dict[str, str]:
+    """字体文件名（小写）→ 显示名（PIL 从字体文件里读家族名+样式；读不出用去后缀的文件名）。"""
+    from PIL import ImageFont
+
+    out: Dict[str, str] = {}
+    for name, path in _font_index(extra_dir).items():
+        disp = name.rsplit(".", 1)[0]
+        try:
+            family, style = ImageFont.truetype(path, 16).getname()
+            disp = f"{family} {style}".strip()
+        except Exception:
+            pass
+        out[name] = disp
     return out
 
 
