@@ -6,24 +6,24 @@
 <title>图库plus</title>
 <style>
 /* 跟随 AstrBot 亮暗主题（bridge 会在 <html> 上维护 data-theme）；一律直角 UI */
-:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456;--err:#c0392b;--warn:#e67e22}
+:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456;--err:#c0392b;--warn:#e67e22;--head:64px}
 [data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab;--err:#e74c3c;--warn:#e67e22}
 body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:1200px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
-h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:5;background:var(--bg)}
 h2 small{color:var(--sub);font-weight:normal;font-size:13px}
 h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
 .spacer{flex:1}
 .bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
-input,button{padding:8px 12px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
-button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
+.bar[hidden]{display:none}  /* display:flex 会压过 UA 的 [hidden]，必须显式关掉 */
+input,button,select,textarea{padding:8px 12px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
+button{cursor:pointer}button:hover,.up:hover,select:hover{background:var(--ctrl-hover)}
 .up{cursor:pointer;color:var(--fg);background:var(--ctrl);border:1px solid var(--line);padding:8px 12px;font-size:14px}
-.up:hover{background:var(--ctrl-hover)}
 .g{border:1px solid var(--line);background:var(--panel);padding:12px;margin-bottom:12px}
 /* 主页：一行四卡、卡片严格正方形；名称靠上、封面（object-fit 裁剪）居中、操作按钮靠下 */
 #list{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 @media (max-width:1000px){#list{grid-template-columns:repeat(2,1fr)}}
 /* 追加分页内容时禁止滚动锚定跟随（sentinel 也要排除，否则视口会被锚拉着跳到新内容末尾） */
-#list,#gimgs,#more-g,#more-i,#sentinel-g,#sentinel-i{overflow-anchor:none}
+#list,#gscroll,#gimgs,#more-g,#more-i,#sentinel-g,#sentinel-i{overflow-anchor:none}
 @media (max-width:640px){#list{grid-template-columns:1fr}}
 .gal{cursor:pointer;margin-bottom:0;padding:0;display:flex;flex-direction:column;overflow:hidden;aspect-ratio:1}
 .gal:hover{border-color:var(--sub)}
@@ -38,17 +38,24 @@ button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
 /* 三件（上传/水印/删除）必须排在一行：卡片是正方形且 overflow:hidden，换行会被裁掉 */
 .gal .ops>*{white-space:nowrap;font-size:13px;padding:6px 9px}
 .gal .ops input[type=checkbox]{margin:0 4px 0 0;vertical-align:-1px}
-.grid{display:flex;flex-wrap:wrap;gap:10px}
-.item{--thumb:150px;position:relative;width:var(--thumb)}
-.item img{width:var(--thumb);height:var(--thumb);object-fit:cover;display:block;background:#000;cursor:zoom-in}
-.item img.bad{background:var(--panel);border:1px dashed var(--line);color:var(--err);font-size:11px;padding:4px;object-fit:contain}
-/* 悬停才出现：右上删除、右下改 PID（按钮贴图片底边，尺寸跟着 --thumb 走） */
+.grid{--cols:7;display:flex;flex-wrap:wrap;gap:10px}
+/* 缩略图随每行张数缩放：宽度 = (容器宽 - 间隔) / 列数 */
+.item{--thumb:calc((100% - (var(--cols) - 1)*10px)/var(--cols));position:relative;width:var(--thumb)}
+/* 显示槽固定正方形（边长=列宽，aspect-ratio 从已定宽推出，绕开百分比高度坑）；
+   object-fit:cover 保比例居中裁掉溢出部分，不变形 */
+.item img{width:100%;aspect-ratio:1;object-fit:cover;object-position:center;display:block;background:#000;cursor:zoom-in}
+.item img.bad{background:var(--panel);border:1px dashed var(--line);color:var(--err);font-size:11px;padding:4px}
+/* 悬停才出现：右上删除、右下改 PID（edit 锚在 pid 标签上方，即图片底边） */
 .item .x,.item .edit{display:none;position:absolute;right:0;border:none;color:#fff;padding:1px 7px;cursor:pointer}
 .item:hover .x,.item:hover .edit{display:block}
 .item .x{top:0;background:var(--err)}
 .item .x.arm{background:var(--warn)}
-.item .edit{top:calc(var(--thumb) - 18px);background:var(--pid)}
+.item .edit{bottom:17px;background:var(--pid)}
 .item .pid{font-size:11px;color:var(--pid);margin-top:2px;max-width:var(--thumb);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 选择模式：悬停小按钮让位，选中的描边 */
+#gimgs.selecting .x,#gimgs.selecting .edit{display:none!important}
+#gimgs.selecting .item{cursor:pointer}
+.item.sel img{outline:3px solid var(--warn);outline-offset:-3px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9}
 .modal[hidden]{display:none}
 .mbox{background:var(--panel);border:1px solid var(--line);padding:16px;width:min(420px,92vw)}
@@ -77,10 +84,49 @@ progress::-moz-progress-bar{background:var(--sub)}
 #up-float{position:fixed;top:10px;right:10px;z-index:99;background:var(--panel);border:1px solid var(--line);padding:8px 12px;font-size:13px;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #up-float[hidden]{display:none}
 #up-float div{margin:2px 0}
+/* 悬停缩略图 1 秒的未裁剪大图 + 信息（参考样式：左图右信息；底色=主色淡化90%）；
+   pointer-events:none 不挡鼠标 */
+#peek{position:fixed;z-index:60;width:376px;max-width:94vw;background:var(--panel);border:1px solid var(--line);padding:10px;font-size:12px;display:none;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.25);gap:10px}
+#peek .pk-img{flex:none;min-width:0}
+/* 竖图：左图右信息（默认 row）；横图：上图下信息、通栏（照参考样式两种排版） */
+#peek.pk-land{flex-direction:column}
+#peek.pk-land img{width:100%;max-width:none;max-height:300px}
+#peek img{display:block;width:auto;height:auto;max-width:196px;max-height:360px}
+#peek .pk-info{flex:1;min-width:0}
+#peek .pk-info div{display:flex;gap:8px;margin:1px 0;word-break:break-all}
+#peek .pk-info b{flex:none;width:4.5em;font-weight:normal}
 .sentinel{height:1px}
 #import-result ul{margin:6px 0;padding-left:20px}
 small{color:var(--sub)}
 summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
+/* 菜单预览页：左控制 / 右预览（预览图就是群里会收到的菜单图，服务端渲染） */
+.menuwrap{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:12px;align-items:start}
+@media (max-width:1000px){.menuwrap{grid-template-columns:1fr}}
+.fld{display:block;margin:8px 0;font-size:13px;color:var(--sub)}
+.fld input[type=text],.fld input:not([type]),.fld textarea,.fld select{width:100%;box-sizing:border-box;margin-top:4px}
+textarea{font-family:inherit;resize:vertical}
+#mu-fonts .part{margin:10px 0}
+#mu-fonts .phead{display:flex;justify-content:space-between;align-items:center;margin:0 0 4px;font-size:13px;color:var(--fg)}
+#mu-fonts .pct-in{display:flex;align-items:center;gap:3px;color:var(--sub)}
+/* 字体选择框做高一点；输入名称即筛选（datalist，Office 式快速查找） */
+#mu-fonts .fselect{width:100%;box-sizing:border-box;padding:10px 8px}
+#mu-fonts .frow{display:flex;gap:6px}
+#mu-fonts .slot{flex:1;min-width:0}
+#mu-fonts .slot small{display:block;margin-bottom:2px;font-size:12px;color:var(--sub)}
+#mu-fonts .fsize{width:64px;padding:10px 6px;text-align:center}
+#menu-preview{width:100%;display:block;border:1px solid var(--line);background:var(--ctrl)}
+/* 批量设置表：复用统一控件风格，紧凑行 */
+#batch-tbl{width:100%;border-collapse:collapse;background:var(--ctrl)}
+#batch-tbl th,#batch-tbl td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;font-size:14px}
+#batch-tbl th{color:var(--sub);font-weight:normal;font-size:13px;white-space:nowrap}
+#batch-tbl td input[type=text],#batch-tbl td select{width:100%;box-sizing:border-box}
+#batch-tbl td.ctr{text-align:center}
+/* 常驻头部：页头 sticky；一级页的建库栏跟在其下 sticky 成第二行；
+   二级/批量卡片限高不超窗口，操作栏钉在卡顶，图片/表格在卡内滚动，表头钉在滚动区顶 */
+#view-main>.bar{position:sticky;top:var(--head);z-index:4;background:var(--bg)}
+#view-gallery .g,#view-batch .g{display:flex;flex-direction:column;max-height:calc(100vh - var(--head) - 40px);box-sizing:border-box;margin-bottom:0}
+#gscroll,#batch-scroll{flex:1;min-height:0;overflow:auto}
+#batch-tbl th{position:sticky;top:0;z-index:1;background:var(--ctrl)}
 </style>
 </head>
 <body>
@@ -88,7 +134,9 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
   <span>图库plus <small>关键词图库管理</small></span>
   <span class="spacer"></span>
   <button id="btn-import" onclick="run(showImport)">批量导入</button>
+  <button id="btn-menu" onclick="run(showMenu)">菜单预览</button>
   <button id="btn-wm" onclick="run(showWm)">水印设置</button>
+  <button id="btn-batch" onclick="run(showBatch)">批量设置</button>
   <button id="btn-back" onclick="run(showMain)" hidden>返回图库列表</button>
 </h2>
 
@@ -110,11 +158,24 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
     <div class="bar">
       <button id="gal-up-btn" class="up">＋上传图片</button>
       <label class="up" title="发送该图库图片时是否附加信息条（默认开启）"><input type="checkbox" id="gal-wm"> 水印</label>
+      <button id="gal-menu-btn">菜单设置</button>
       <button id="gal-del">删除图库</button>
+      <span class="spacer"></span>
+      <button id="cols-btn" title="每行张数 3~8 循环切换">每行 7 张</button>
+      <button id="sel-btn">选择</button>
     </div>
-    <div id="gimgs" class="grid"></div>
-    <div id="sentinel-i" class="sentinel"></div>
-    <button id="more-i" onclick="run(loadImages)" hidden>加载更多</button>
+    <div class="bar" id="sel-bar" hidden>
+      <span id="sel-stat" class="hint" style="margin:0">已选 0 张</span>
+      <button id="sel-del">删除选中</button>
+      <button id="sel-move">移动到…</button>
+      <button id="sel-copy">复制到…</button>
+    </div>
+    <div id="gal-result"></div>
+    <div id="gscroll">
+      <div id="gimgs" class="grid"></div>
+      <div id="sentinel-i" class="sentinel"></div>
+      <button id="more-i" onclick="run(loadImages)" hidden>加载更多</button>
+    </div>
   </div>
 </div>
 
@@ -172,6 +233,92 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
   </div>
 </div>
 
+<!-- 批量设置：所有图库一行一个，改动即存。与 pages/settings 独立页同款表格；
+     bridge 的鉴权上下文由父页面只在加载时发一次，location.href 跳到别的 Page 会收不到
+     （ready() 挂起 → API 未授权），所以表在这里内置一份，不能跳转过去 -->
+<div id="view-batch" hidden>
+  <div class="g">
+    <h3><span>图库批量设置</span><small id="batch-stat"></small><button onclick="run(loadBatch)">刷新</button></h3>
+    <div id="batch-scroll">
+      <table id="batch-tbl">
+        <thead><tr><th>图库</th><th>张数</th><th>水印</th><th>进菜单</th><th>角色名称</th><th>分组</th></tr></thead>
+        <tbody id="batch-rows"></tbody>
+      </table>
+    </div>
+    <div id="batch-result"></div>
+  </div>
+</div>
+
+<!-- 菜单预览：所见即所得（预览图由服务端按当前设置渲染，改文字/字体/背景立刻重渲） -->
+<div id="view-menu" hidden>
+  <div class="menuwrap">
+    <div class="g">
+      <h3>菜单文字 <small id="menu-stat"></small></h3>
+      <label class="fld">标题<input id="mu-title" spellcheck="false"></label>
+      <label class="fld">副标题（一行一句，最多 6 行）<textarea id="mu-subtitle" rows="3" spellcheck="false"></textarea></label>
+      <label class="fld">右上角标签<input id="mu-label" spellcheck="false"></label>
+      <label class="fld">底部说明<input id="mu-footer" spellcheck="false"></label>
+      <label class="fld">右下角备注（一行一句，最多 6 行）<textarea id="mu-note" rows="2" spellcheck="false"></textarea></label>
+      <h3>各部件字体</h3>
+      <div id="mu-fonts"></div>
+      <div class="bar" style="margin-top:8px">
+        <label class="up">＋上传字体文件<input type="file" id="mu-font-file" accept=".ttf,.ttc,.otf" hidden></label>
+      </div>
+      <div class="hint">
+        每个部件可分别为 中文字体（含汉字）/ 英文·数字 / 日文（假名）各选一个字体：框里直接输入名称即可快速筛选
+        （显示的是字体自己的名字，输文件名也认）。可用系统已安装的字体，或上传 .ttf/.ttc/.otf（上限 30MB），
+        字体池与「水印设置」共用；右上的百分比是字号（100 = 参考样式的大小，可填 50~200）。
+        行距与版式固定不变，字号调太大可能挤到相邻行，预览里能直接看到。
+      </div>
+      <h3>顶部背景图</h3>
+      <div class="bar">
+        <label class="up">＋上传背景图<input type="file" id="mu-bg-file" accept="image/*" hidden></label>
+      </div>
+      <div class="hint">
+        背景图只铺在最上面的页眉区（按比例裁切铺满）。标题与副标题是白字，<b>请选深色背景图</b>，浅色图会看不清；
+        不传就用内置的深色渐变。字体可选系统已安装的，也可在「水印设置」里上传字体文件（中英文都能选同一个字体）。
+      </div>
+      <div id="menu-result"></div>
+    </div>
+    <div class="g">
+      <h3>预览 <small>这就是群里发「图片帮助」时会收到的菜单图</small></h3>
+      <img id="menu-preview" alt="菜单预览">
+    </div>
+  </div>
+</div>
+
+<!-- 图库菜单配置：是否进菜单 / 角色名称 / 所属分组 -->
+<div id="menu-modal" class="modal" hidden>
+  <div class="mbox">
+    <h3>菜单设置 <small id="mm-gal"></small></h3>
+    <label class="fld"><input type="checkbox" id="mm-show"> 在「图片帮助」菜单里显示这个图库</label>
+    <label class="fld">角色名称（菜单里显示为 角色名称-关键词）<input id="mm-char" spellcheck="false"></label>
+    <label class="fld">所属分组
+      <select id="mm-group">
+        <option>个人</option><option>团体</option><option>功能</option>
+      </select>
+    </label>
+    <div class="bar" style="margin:12px 0 0">
+      <button id="mm-ok">保存</button>
+      <button id="mm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量移动/复制目标选择 -->
+<div id="xfer-modal" class="modal" hidden>
+  <div class="mbox">
+    <h3><span id="xfer-title"></span> <small id="xfer-n"></small></h3>
+    <label class="fld">目标图库
+      <select id="xfer-dst"></select>
+    </label>
+    <div class="bar" style="margin:12px 0 0">
+      <button id="xfer-ok">确定</button>
+      <button id="xfer-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
 <!-- PID 编辑弹窗 -->
 <div id="modal" class="modal" hidden>
   <div class="mbox">
@@ -212,6 +359,12 @@ summary{cursor:pointer;color:var(--warn);margin:10px 0 6px}
 <!-- 关窗后仍在进行的上传：页面右上角简要动态 -->
 <div id="up-float" hidden></div>
 
+<!-- 悬停缩略图出的未裁剪大图预览 + 信息 -->
+<div id="peek"></div>
+
+<!-- 菜单页字体快速查找的候选列表（内容由脚本按可用字体填充） -->
+<datalist id="menu-fonts"></datalist>
+
 <script>
 "use strict";
 // 受限 iframe 里 alert/confirm 会被静默吞掉，所有反馈一律渲染进页面
@@ -219,12 +372,19 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function fail(e){
   console.error(e);
-  const box = $('#import-result') && !$('#view-import').hidden ? $('#import-result') : $('#list');
+  const box = $('#import-result') && !$('#view-import').hidden ? $('#import-result')
+    : ($('#menu-result') && !$('#view-menu').hidden ? $('#menu-result')
+    : ($('#batch-result') && !$('#view-batch').hidden ? $('#batch-result') : $('#list')));
   if (box) box.insertAdjacentHTML('afterbegin',
     `<p class="err">出错了：${esc((e && e.message) || e)}\n（若提示 bridge 未加载，说明当前 AstrBot 版本不支持插件 Pages）</p>`);
 }
 window.onerror = (m) => { fail(m); };
 window.addEventListener('unhandledrejection', e => fail(e.reason));
+
+// 页头实高写入 --head：一级页建库栏的 sticky top 与二级/批量卡片限高都用它（窄屏按钮换行也算得对）
+const setHead = () => document.documentElement.style.setProperty('--head', Math.ceil($('h2').getBoundingClientRect().height) + 'px');
+setHead();
+addEventListener('resize', setHead);
 
 let B = null; // bridge 惰性获取：SDK 由仪表盘自动注入，时机不定，轮询等它出现
 function whenBridge(ms = 10000){
@@ -258,21 +418,229 @@ function showMain(){
   $('#view-gallery').hidden = true;
   $('#view-import').hidden = true;
   $('#view-wm').hidden = true;
+  $('#view-menu').hidden = true;
+  $('#view-batch').hidden = true;
   $('#view-main').hidden = false;
   $('#btn-import').hidden = false;
+  $('#btn-menu').hidden = false;
   $('#btn-wm').hidden = false;
+  $('#btn-batch').hidden = false;
   $('#btn-back').hidden = true;
   $('#import-result').innerHTML = '';
-  run(() => loadGalleries(true));
+  if (S.mainDirty){  // 在别处改了列表内容（删库/上传完）：重拉并回顶
+    S.mainDirty = false;
+    scrollTo(0, 0);
+    run(() => loadGalleries(true));
+  } else if (S.mainScroll != null) {  // 原样回来：一级页面的内容、翻页进度、位置都不动
+    document.scrollingElement.scrollTop = S.mainScroll;
+  }
 }
 function showImport(){
   $('#view-main').hidden = true;
   $('#view-import').hidden = false;
+  $('#view-menu').hidden = true;
   $('#btn-import').hidden = true;
+  $('#btn-menu').hidden = true;
   $('#btn-wm').hidden = true;
+  $('#btn-batch').hidden = true;
   $('#btn-back').hidden = false;
   $('#import-result').innerHTML = '';
 }
+
+// ---------- 批量设置：所有图库一行一个，改动即存（与 pages/settings 独立页同款） ----------
+
+const GROUPS = ['个人', '团体', '功能'];
+const batchSavers = new Map();  // 图库名 → debounce 定时器（400ms 内连续改动合并成一次保存）
+
+function batchRow(g){
+  const tr = document.createElement('tr');
+  tr.dataset.name = g.name;
+  const q = s => tr.querySelector(s);
+  tr.innerHTML = `<td title="${esc(g.name)}">${esc(g.name)}</td><td>${g.count}</td>
+    <td class="ctr"><input type="checkbox" class="wm"${g.wm ? ' checked' : ''}></td>
+    <td class="ctr"><input type="checkbox" class="show"${g.menu.show ? ' checked' : ''}></td>
+    <td><input type="text" class="char" value="${esc(g.menu.char)}" spellcheck="false"></td>
+    <td><select class="group">${GROUPS.map(x => `<option${x === g.menu.group ? ' selected' : ''}>${x}</option>`).join('')}</select></td>`;
+  const stat = t => $('#batch-stat').textContent = `已保存 ${new Date().toLocaleTimeString()} ｜ ${t}`;
+  const menuSave = () => {
+    clearTimeout(batchSavers.get(g.name));
+    batchSavers.set(g.name, setTimeout(() => run(async () => {
+      await act({action:'set_gallery_menu', name:g.name, show:q('.show').checked,
+                 char:q('.char').value.trim(), group:q('.group').value});
+      stat(g.name);
+    }), 400));
+  };
+  q('.wm').onchange = e => run(async () => {
+    const res = await act({action:'set_wm', name:g.name, enabled:e.target.checked});
+    e.target.checked = pick(res, 'wm') !== false;  // 以服务端结果为准：没存上时勾选框回弹
+    stat(g.name);
+  });
+  for (const el of tr.querySelectorAll('.show,.char,.group')){
+    el.oninput = menuSave;
+    el.onchange = menuSave;  // 个别浏览器 select/checkbox 不发 input，兜一层
+  }
+  return tr;
+}
+
+async function loadBatch(){
+  $('#batch-rows').innerHTML = '<tr><td colspan="6" class="hint">加载中…</td></tr>';
+  const gs = pick(await act({action:'list_all_settings'}), 'galleries') || [];
+  const tb = $('#batch-rows');
+  tb.innerHTML = '';
+  for (const g of gs) tb.appendChild(batchRow(g));
+  if (!gs.length) tb.innerHTML = '<tr><td colspan="6" class="hint">还没有图库，先创建一个。</td></tr>';
+}
+
+function showBatch(){
+  S.gal = null;
+  $('#view-main').hidden = true;
+  $('#view-import').hidden = true;
+  $('#view-gallery').hidden = true;
+  $('#view-wm').hidden = true;
+  $('#view-menu').hidden = true;
+  $('#view-batch').hidden = false;
+  $('#btn-import').hidden = true;
+  $('#btn-menu').hidden = true;
+  $('#btn-wm').hidden = true;
+  $('#btn-batch').hidden = true;
+  $('#btn-back').hidden = false;
+  $('#import-result').innerHTML = '';
+  run(loadBatch);
+}
+
+// ---------- 菜单预览（所见即所得）：改文字/字体/背景 → 服务端重渲预览图 ----------
+
+function showMenu(){
+  $('#view-main').hidden = true;
+  $('#view-import').hidden = true;
+  $('#view-gallery').hidden = true;
+  $('#view-wm').hidden = true;
+  $('#view-menu').hidden = false;
+  $('#btn-import').hidden = true;
+  $('#btn-menu').hidden = true;
+  $('#btn-wm').hidden = true;
+  $('#btn-batch').hidden = true;
+  $('#btn-back').hidden = false;
+  $('#import-result').innerHTML = '';
+  run(loadMenu);
+}
+
+// 服务端返回的文字/字体/字号/预览图 → 填进表单（文字只在首次加载时写入，别打断正在输入的内容）
+const MENU = {names: {}, byDisplay: {}, avail: new Set()};  // 文件名→显示名 / 显示名→文件名 / 可用文件名集合
+const fontDisp = file => MENU.names[String(file || '').toLowerCase()] || file || '';
+function fillMenu(res){
+  const texts = pick(res, 'texts') || {}, fonts = pick(res, 'fonts') || {}, sizes = pick(res, 'sizes') || {};
+  const parts = pick(res, 'parts') || [], avail = pick(res, 'available') || [], names = pick(res, 'names') || {};
+  for (const [id, key] of [['#mu-title','title'],['#mu-subtitle','subtitle'],['#mu-label','label'],
+                           ['#mu-footer','footer'],['#mu-note','note']]){
+    const el = $(id);
+    if (el.dataset.init !== '1'){ el.value = texts[key] || ''; el.dataset.init = '1'; }
+  }
+  if (!parts.length) return;   // 出错时后端不带 parts：别把已经建好的字体选择框清空
+  MENU.names = names;
+  MENU.byDisplay = {};         // 显示名 → 文件名（同名显示先到先得；文件名始终也能直接输）
+  MENU.avail = new Set(avail.map(n => n.toLowerCase()));
+  for (const n of avail){
+    const d = names[n] || n;
+    if (!(d in MENU.byDisplay)) MENU.byDisplay[d] = n;
+  }
+  let dl = $('#menu-fonts');   // 共享一个 datalist：输入即筛选（Office 式快速查找）
+  const seen = new Set();
+  dl.innerHTML = avail.filter(n => {
+    const d = names[n] || n;
+    if (seen.has(d)) return false;
+    seen.add(d);
+    return true;
+  }).map(n => `<option value="${esc(names[n] || n)}">`).join('');
+  $('#mu-fonts').innerHTML = parts.map(p => {
+    const f3 = fonts[p.key] || {};
+    const pct = sizes[p.key] != null ? sizes[p.key] : 100;
+    const slot = (script, label) => {
+      const file = String(f3[script] || '');
+      return `<span class="slot"><small>${label}</small>` +
+        `<input class="fselect" type="text" list="menu-fonts" autocomplete="off" spellcheck="false"` +
+        ` data-part="${esc(p.key)}" data-script="${script}" data-file="${esc(file)}" value="${esc(fontDisp(file))}"></span>`;
+    };
+    return `<div class="part"><p class="phead">${esc(p.label)}` +
+      `<span class="pct-in"><input class="fsize" type="number" min="50" max="200" step="5" value="${pct}"` +
+      ` data-size="${esc(p.key)}" title="字号：100 = 参考样式大小，可填 50~200"><span class="pct">%</span></span></p>` +
+      `<div class="frow">${slot('cjk','中文')}${slot('latin','英文/数字')}${slot('jp','日文')}</div></div>`;
+  }).join('');
+  const src = pick(res, 'src');
+  if (src) $('#menu-preview').src = src;
+}
+async function loadMenu(){ fillMenu(await act({action:'get_menu'})); }
+
+async function saveMenu(){
+  const texts = {};
+  for (const [id, key] of [['#mu-title','title'],['#mu-subtitle','subtitle'],['#mu-label','label'],
+                           ['#mu-footer','footer'],['#mu-note','note']]) texts[key] = $(id).value;
+  const fonts = {};
+  for (const inp of $('#mu-fonts').querySelectorAll('input[data-part]')) {
+    const v = inp.value.trim();
+    const file = MENU.byDisplay[v] || (MENU.avail.has(v.toLowerCase()) ? v : '');  // 显示名/文件名都认
+    if (!file){  // 没打中任何字体：退回原值，这个槽不保存（其余槽照常）
+      inp.value = fontDisp(inp.dataset.file);
+      continue;
+    }
+    (fonts[inp.dataset.part] ||= {})[inp.dataset.script] = file;
+    inp.dataset.file = file;
+    inp.value = fontDisp(file);
+  }
+  const sizes = {};
+  for (const inp of $('#mu-fonts').querySelectorAll('input[data-size]')) sizes[inp.dataset.size] = inp.value;
+  const res = await act({action:'save_menu', texts, fonts, sizes});
+  if (pick(res, 'status') === 'error'){ fail(pick(res, 'message') || '保存失败'); return; }
+  fillMenu(res);
+  $('#menu-stat').textContent = `已保存 ${new Date().toLocaleTimeString()}`;
+}
+
+let menuTimer = null;  // 打字停顿 400ms 再落盘并重渲，别每按一个字请求一次
+const menuChanged = () => { clearTimeout(menuTimer); menuTimer = setTimeout(() => run(saveMenu), 400); };
+for (const id of ['#mu-title','#mu-subtitle','#mu-label','#mu-footer','#mu-note'])
+  $(id).oninput = menuChanged;
+$('#mu-fonts').oninput = menuChanged;   // 换字体 / 改字号：停顿后落盘并重渲（无保存按钮）
+$('#mu-fonts').onchange = menuChanged;  // 个别浏览器 select 不发 input，兜一层
+
+$('#mu-bg-file').onchange = e => run(async () => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  fillMenu(await act({action:'upload_menu_bg', name: f.name, data: await readB64(f)}));
+  $('#menu-stat').textContent = '背景图已更新';
+});
+
+// 上传字体进字体池（复用「水印设置」那个 action，同一个池）→ 刷新下拉，选中即用
+$('#mu-font-file').onchange = e => run(async () => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  await act({action:'upload_font', name: f.name, data: await readB64(f)});
+  await loadMenu();
+  $('#menu-stat').textContent = `字体 ${f.name} 已上传，在对应部件里选中即生效`;
+});
+
+// ---------- 单个图库的菜单设置（进菜单 / 角色名 / 分组）----------
+
+let mmGal = null;  // 菜单设置弹窗当前针对的图库（一级页面卡片和二级页都会打开它）
+async function openMenuCfg(name){
+  const res = await act({action:'get_gallery_menu', name});
+  const m = pick(res, 'menu') || {};
+  mmGal = name;
+  $('#mm-gal').textContent = name;
+  $('#mm-show').checked = m.show !== false;   // 缺省进菜单
+  $('#mm-char').value = m.char || name;
+  $('#mm-group').value = ['个人','团体','功能'].includes(m.group) ? m.group : '个人';
+  $('#menu-modal').hidden = false;
+}
+$('#gal-menu-btn').onclick = () => run(() => openMenuCfg(S.gal));
+$('#mm-ok').onclick = () => run(async () => {
+  await act({action:'set_gallery_menu', name:mmGal, show:$('#mm-show').checked,
+             char:$('#mm-char').value.trim(), group:$('#mm-group').value});
+  $('#menu-modal').hidden = true;
+});
+$('#mm-cancel').onclick = () => { $('#menu-modal').hidden = true; };
+$('#menu-modal').onclick = e => { if (e.target.id === 'menu-modal') $('#menu-modal').hidden = true; };
 
 // ---------- 水印设置 ----------
 
@@ -280,9 +648,12 @@ function showWm(){
   $('#view-main').hidden = true;
   $('#view-import').hidden = true;
   $('#view-gallery').hidden = true;
+  $('#view-menu').hidden = true;
   $('#view-wm').hidden = false;
   $('#btn-import').hidden = true;
+  $('#btn-menu').hidden = true;
   $('#btn-wm').hidden = true;
+  $('#btn-batch').hidden = true;
   $('#btn-back').hidden = false;
   $('#import-result').innerHTML = '';
   run(loadWm);
@@ -342,7 +713,8 @@ const observeImg = img => io ? io.observe(img) : loadThumb(img);
 
 // ---------- 一级：图库列表（20/页，滑到底自动加载，也有加载按钮） ----------
 
-const S = {off: 0, total: null, busyG: false, gal: null, ioff: 0, itotal: null, busyI: false};
+const S = {off: 0, total: null, busyG: false, gal: null, ioff: 0, itotal: null, busyI: false,
+           mainScroll: null, mainDirty: false, selMode: false, sel: new Set()};
 // 刚建的图库：本次会话里置顶显示（服务端一直按名称排序）；页面刷新后 pinG 归零，回到正常排序
 let pinG = null;
 const inView = el => { const r = el.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; };
@@ -354,13 +726,13 @@ function galRow(g){
   d.innerHTML = `<div class="name"><span>${esc(g.name)}</span><small>${g.count} 张</small></div>
     <div class="cover"></div>
     <div class="ops">
-      <button class="up-open">＋上传</button>
+      <button class="cfg">图库设置</button>
       <label class="up" title="发送该图库图片时是否附加信息条"><input type="checkbox" class="wm"> 水印</label>
       <button class="del">删除图库</button>
     </div>`;
   d.onclick = () => run(() => openGallery(g.name, g.wm));
   d.querySelector('.ops').onclick = e => e.stopPropagation();
-  d.querySelector('.up-open').onclick = () => openUp(g.name);
+  d.querySelector('.cfg').onclick = () => run(() => openMenuCfg(g.name));
   d.querySelector('.del').onclick = e => run(() => delG(g.name, e.target));
   const wm = d.querySelector('.wm');
   wm.checked = g.wm !== false;                    // 缺省开
@@ -433,14 +805,20 @@ async function loadGalleries(reset){
 
 async function openGallery(name, wm){
   S.gal = name;
+  S.mainScroll = document.scrollingElement.scrollTop;  // 记住一级页面位置，返回时恢复
   $('#gal-title').textContent = name;
   $('#gal-wm').checked = wm !== false;  // 缺省开
+  $('#gal-result').innerHTML = '';
+  setSelMode(false);  // 上个图库的选择态不带走
   $('#view-main').hidden = true;
   $('#view-import').hidden = true;
   $('#view-wm').hidden = true;
+  $('#view-menu').hidden = true;
   $('#view-gallery').hidden = false;
   $('#btn-import').hidden = true;
+  $('#btn-menu').hidden = true;
   $('#btn-wm').hidden = true;
+  $('#btn-batch').hidden = true;
   $('#btn-back').hidden = false;
   scrollTo(0, 0);
   await loadImages(true);
@@ -454,14 +832,74 @@ function imgItem(gal, im){
     <div class="pid" title="${esc(im.pid || '')}">${im.pid ? 'PID:' + esc(im.pid) : '无PID'}</div>`;
   it.querySelector('.x').onclick = e => run(() => delI(gal, im.file, e.target));
   it.querySelector('.edit').onclick = () => editPid(gal, im, it.querySelector('.pid'));
+  it.onclick = () => { if (S.selMode) toggleSel(it, im.file); };  // 选择模式：点卡片切换选中
   const img = document.createElement('img');
   img.dataset.g = gal; img.dataset.f = im.file;
-  img.dataset.s = 320;  // 缩略图显示 150px，取 320 档保清晰（后端收敛到 80~1600）
-  img.title = '点击查看大图';
-  img.onclick = () => run(() => viewBig(gal, im.file));
+  img.dataset.s = cols <= 4 ? 640 : 320;  // 列少图大取 640 档保清晰，其余 320（后端收敛到 80~1600）
+  // 提示不设 title（会跟悬停信息框重复）；"点击查看大图" 合并在信息框里
+  img.onmouseenter = () => {  // 悬停 1 秒：缩略图旁边浮出未裁剪大图与信息，移开即收
+    if (S.selMode) return;
+    hidePeek();
+    peekTimer = setTimeout(() => showPeek(gal, im.file, img), 1000);
+  };
+  img.onmouseleave = hidePeek;
+  img.onclick = () => { hidePeek(); if (!S.selMode) run(() => viewBig(gal, im.file)); };
   it.prepend(img);
   observeImg(img);
   return it;
+}
+
+// 悬停预览：1 秒后缩略图旁边浮出参考样式的卡片——左未裁剪大图、右信息，底色=主色淡化90%。
+// 大图先用网格已加载的缩略图立即顶上（必现），800 档高清到了再无感替换；信息独立加载
+let peekTimer = null, peekKey = '';
+const fmtSize = n => { n = +n || 0; return n < 1024 ? n + ' B'
+  : Math.round(n / 1024).toLocaleString('en-US') + ' KB'; };  // 1,452KB 样式
+function hidePeek(){
+  clearTimeout(peekTimer); peekTimer = null; peekKey = '';
+  const p = $('#peek');
+  p.style.display = 'none';
+  p.style.background = '';
+  p.style.color = '';
+}
+function showPeek(gal, file, el){
+  const p = $('#peek');
+  peekKey = gal + '/' + file;
+  const key = peekKey;
+  const gridSrc = el.complete && el.naturalWidth ? el.src : '';
+  p.classList.toggle('pk-land', el.naturalWidth > el.naturalHeight);  // 横图上图下信息，竖图左图右信息
+  p.innerHTML = `<div class="pk-img">${gridSrc ? `<img src="${gridSrc}" alt="">` : ''}</div>` +
+    `<div class="pk-info hint">加载中…</div>`;
+  const r = el.getBoundingClientRect();
+  let left = r.right + 8;  // 默认贴缩略图右侧，放不下换左侧：绝不盖住悬停中的那张
+  if (left + 376 > innerWidth) left = Math.max(8, r.left - 376 - 8);
+  p.style.left = left + 'px';
+  p.style.top = Math.max(8, Math.min(r.top, innerHeight - 420)) + 'px';
+  p.style.display = 'flex';
+  act({action:'wm_preview', name:gal, image:file, size:800}).then(res => {  // 发送时带水印的真实效果
+    if (peekKey !== key) return;
+    const src = extractSrc(res);
+    if (!src) return;
+    const im = p.querySelector('.pk-img img');
+    if (im) im.src = src;  // 无缝换带水印版，失败就留网格图
+  }).catch(() => {});
+  act({action:'image_info', name:gal, image:file}).then(res => {
+    if (peekKey !== key) return;
+    const color = pick(res, 'color');
+    if (color){ p.style.background = color; p.style.color = '#333'; }  // 淡化主色恒为浅底，压深色字
+    const info = p.querySelector('.pk-info');
+    if (info) info.innerHTML =
+      `<div><b>图库</b><span>${esc(pick(res, 'gallery') || gal)}</span></div>` +
+      `<div><b>文件名</b><span>${esc(pick(res, 'file') || file)}</span></div>` +
+      `<div><b>文件大小</b><span>${fmtSize(pick(res, 'size'))}</span></div>` +
+      `<div><b>UID</b><span>${esc(pick(res, 'uid') || '无')}${pick(res, 'pid') ? '（PID ' + esc(pick(res, 'pid')) + '）' : ''}</span></div>` +
+      `<div><b>发送次数</b><span>${pick(res, 'sends') || 0} 次</span></div>` +
+      `<div><b>位置</b><span>${esc(pick(res, 'path') || '')}</span></div>` +
+      `<div class="hint" style="margin:4px 0 0;color:#777">单击缩略图可以查看大图</div>`;
+  }).catch(() => {
+    if (peekKey !== key) return;
+    const info = p.querySelector('.pk-info');
+    if (info) info.innerHTML = '<div class="hint" style="margin:0">单击缩略图可以查看大图</div>';
+  });
 }
 
 // 高清大图：直接复用 fetchSrc 的 thumb(1600) → raw 兜底链路，拿到的就是原图级清晰度
@@ -509,6 +947,8 @@ async function loadImages(reset){
     const imgs = pick(res, 'images') || [];
     S.itotal = pick(res, 'total');
     S.ioff += imgs.length;
+    const c = parseInt(pick(res, 'cols'), 10);  // 服务端记住的每行张数；用户本会话改过就不再覆盖
+    if (!colsTouched && c >= 3 && c <= 8 && c !== cols) applyCols(c);
     $('#gal-count').textContent = `${S.itotal} 张`;
     pinScroll(() => { for (const im of imgs) $('#gimgs').appendChild(imgItem(gal, im)); });
     const done = S.itotal != null && S.ioff >= S.itotal;
@@ -617,6 +1057,7 @@ function upRun(t){
       upStat(t);
       if (!$('#view-gallery').hidden && S.gal === t.name) run(() => loadImages(true));   // 收尾刷一次
       if (!$('#view-main').hidden) run(() => loadGalleries(true));
+      else S.mainDirty = true;  // 上传完时不在一级页面：张数/封面已过期，回去再刷
       upFloat();
     }
   };
@@ -718,12 +1159,87 @@ async function delI(name, image, btn){
 async function delG(name, btn){
   if (!armed(btn, '确认删除图库?')) return;
   await act({action: 'delete', name});
+  S.mainDirty = true;  // 一级页面的卡片已经过期
   if (pinG && pinG.name === name) pinG = null;  // 置顶的库没了，别留幽灵卡片
-  if (S.gal === name) await showMain();
-  else await loadGalleries(true);
+  if (S.gal === name) await showMain();         // 从二级页删的：showMain 里重拉并回顶
+  else { S.mainDirty = false; await loadGalleries(true); }  // 从卡片删的：当场重拉
 }
 $('#gal-up-btn').onclick = () => openUp(S.gal);
 $('#gal-del').onclick = e => run(() => delG(S.gal, e.target));
+
+// ---------- 二级页：每行张数（3~8 循环）+ 选择模式批量操作 ----------
+
+let cols = 7, colsTouched = false;
+
+function applyCols(n){
+  cols = n;
+  $('#gimgs').style.setProperty('--cols', n);
+  $('#cols-btn').textContent = `每行 ${n} 张`;
+}
+
+$('#cols-btn').onclick = () => {
+  applyCols(cols >= 8 ? 3 : cols + 1);
+  colsTouched = true;  // 本会话不再吃服务端回传的旧值
+  act({action:'save_settings', cols}).catch(fail);  // 记住偏好（settings.json，即发即忘）
+};
+
+function setSelMode(on){
+  S.selMode = on;
+  S.sel.clear();
+  for (const it of document.querySelectorAll('#gimgs .item')) it.classList.remove('sel');
+  $('#gimgs').classList.toggle('selecting', on);
+  $('#sel-bar').hidden = !on;
+  $('#sel-stat').textContent = '已选 0 张';
+  $('#sel-btn').textContent = on ? '退出选择' : '选择';
+}
+$('#sel-btn').onclick = () => setSelMode(!S.selMode);
+
+function toggleSel(it, file){
+  if (S.sel.has(file)){ S.sel.delete(file); it.classList.remove('sel'); }
+  else { S.sel.add(file); it.classList.add('sel'); }
+  $('#sel-stat').textContent = `已选 ${S.sel.size} 张`;
+}
+
+$('#sel-del').onclick = e => run(async () => {
+  if (!S.sel.size) return;
+  if (!armed(e.target, '确认删除?')) return;
+  const res = await act({action:'batch', op:'delete', src:S.gal, images:[...S.sel]});
+  const bad = pick(res, 'failed') || [];
+  $('#gal-result').innerHTML = `<p class="hint">已删除 ${pick(res,'done')||0} 张${bad.length ? `，${bad.length} 张失败` : ''}</p>`;
+  setSelMode(false);
+  S.mainDirty = true;  // 张数/封面可能变了
+  await loadImages(true);
+});
+
+let xferOp = null;
+async function openXfer(op){
+  if (!S.sel.size){ fail('未选中任何图片'); return; }
+  xferOp = op;
+  $('#xfer-title').textContent = op === 'move' ? '移动到' : '复制到';
+  $('#xfer-n').textContent = `选中 ${S.sel.size} 张，目标图库：`;
+  const res = await act({action:'list_all_settings'});
+  $('#xfer-dst').innerHTML = (pick(res, 'galleries') || [])
+    .filter(g => g.name !== S.gal)
+    .map(g => `<option>${esc(g.name)}</option>`).join('');
+  $('#xfer-modal').hidden = false;
+}
+$('#sel-move').onclick = () => run(() => openXfer('move'));
+$('#sel-copy').onclick = () => run(() => openXfer('copy'));
+$('#xfer-cancel').onclick = () => { $('#xfer-modal').hidden = true; };
+$('#xfer-modal').onclick = e => { if (e.target.id === 'xfer-modal') $('#xfer-modal').hidden = true; };
+$('#xfer-ok').onclick = () => run(async () => {
+  const dst = $('#xfer-dst').value;
+  if (!dst) return;
+  const res = await act({action:'batch', op:xferOp, src:S.gal, dst, images:[...S.sel]});
+  $('#xfer-modal').hidden = true;
+  const bad = pick(res, 'failed') || [];
+  $('#gal-result').innerHTML =
+    `<p class="hint">已${xferOp === 'move' ? '移动' : '复制'} ${pick(res,'done')||0} 张` +
+    `${bad.length ? `，跳过 ${bad.length} 张（目标已有同名）` : ''}</p>`;
+  setSelMode(false);
+  S.mainDirty = true;
+  await loadImages(true);
+});
 
 // ---------- 批量导入 ----------
 

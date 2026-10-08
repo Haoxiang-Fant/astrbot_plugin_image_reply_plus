@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>图库批量设置</title>
+<style>
+/* 同管理页的亮暗主题与直角控件风格（bridge 会在 <html> 上维护 data-theme） */
+:root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--err:#c0392b}
+[data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--err:#e74c3c}
+body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:1200px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
+h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 6px}
+h2 small{color:var(--sub);font-weight:normal;font-size:13px}
+input,button,select{padding:8px 12px;border:1px solid var(--line);background:var(--ctrl);color:var(--fg);font-size:14px}
+button{cursor:pointer}button:hover{background:var(--ctrl-hover)}
+.hint{color:var(--sub);font-size:13px;margin:6px 0 10px;line-height:1.7}
+.err{color:var(--err);white-space:pre-wrap;word-break:break-all}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line)}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;font-size:14px}
+th{color:var(--sub);font-weight:normal;font-size:13px;white-space:nowrap}
+td .nm{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
+td input[type=text],td select{width:100%;box-sizing:border-box}
+td.ctr{text-align:center}
+</style>
+</head>
+<body>
+<h2>图库批量设置 <small>所有图库一行一个，改动即自动保存</small>
+  <span style="flex:1"></span>
+  <button onclick="run(load)">刷新</button>
+</h2>
+<div class="hint">水印 = 发送该图库图片时是否附加信息条；菜单三项决定该图库在「图片帮助」菜单里的显示、角色名称与分组。</div>
+<div id="stat" class="hint"></div>
+<table>
+  <thead><tr><th>图库</th><th>张数</th><th>水印</th><th>进菜单</th><th>角色名称</th><th>分组</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div id="err"></div>
+<script>
+"use strict";
+// 受限 iframe 里 alert/confirm 不可用：反馈一律渲染进页面
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fail(e){
+  console.error(e);
+  $('#err').insertAdjacentHTML('afterbegin',
+    `<p class="err">出错了：${esc((e && e.message) || e)}\n（若提示 bridge 未加载，说明当前 AstrBot 版本不支持插件 Pages，或需要重载插件）</p>`);
+}
+window.onerror = (m) => { fail(m); };
+window.addEventListener('unhandledrejection', e => fail(e.reason));
+async function run(fn){ try { await fn(); } catch (e) { fail(e); } }
+
+let B = null; // bridge 惰性获取：SDK 由仪表盘自动注入，时机不定，轮询等它出现
+function whenBridge(ms = 10000){
+  return new Promise((ok, bad) => {
+    const t0 = Date.now();
+    (function poll(){
+      if (window.AstrBotPluginPage) return ok(window.AstrBotPluginPage);
+      if (Date.now() - t0 > ms) return bad(new Error('bridge 未加载'));
+      setTimeout(poll, 50);
+    })();
+  });
+}
+const act = b => B.apiPost('galleries', b);
+// 兼容原始返回或 {status,data} 信封两种响应形态
+const pick = (body, key) => (body && body.data && body.data[key] !== undefined) ? body.data[key] : body ? body[key] : undefined;
+
+const GROUPS = ['个人', '团体', '功能'];
+const savers = new Map();  // 图库名 → debounce 定时器（400ms 内的连续改动合并成一次保存）
+const stat = t => $('#stat').textContent = `已保存 ${new Date().toLocaleTimeString()} ｜ ${t}`;
+
+function row(g){
+  const tr = document.createElement('tr');
+  tr.dataset.name = g.name;
+  const q = s => tr.querySelector(s);
+  tr.innerHTML = `<td><span class="nm" title="${esc(g.name)}">${esc(g.name)}</span></td>
+    <td>${g.count}</td>
+    <td class="ctr"><input type="checkbox" class="wm"${g.wm ? ' checked' : ''}></td>
+    <td class="ctr"><input type="checkbox" class="show"${g.menu.show ? ' checked' : ''}></td>
+    <td><input type="text" class="char" value="${esc(g.menu.char)}" spellcheck="false"></td>
+    <td><select class="group">${GROUPS.map(x => `<option${x === g.menu.group ? ' selected' : ''}>${x}</option>`).join('')}</select></td>`;
+  const menuSave = () => {
+    clearTimeout(savers.get(g.name));
+    savers.set(g.name, setTimeout(() => run(async () => {
+      await act({action:'set_gallery_menu', name:g.name, show:q('.show').checked,
+                 char:q('.char').value.trim(), group:q('.group').value});
+      stat(g.name);
+    }), 400));
+  };
+  q('.wm').onchange = e => run(async () => {
+    const res = await act({action:'set_wm', name:g.name, enabled:e.target.checked});
+    e.target.checked = pick(res, 'wm') !== false;  // 以服务端结果为准：没存上时勾选框回弹
+    stat(g.name);
+  });
+  for (const el of tr.querySelectorAll('.show,.char,.group')){
+    el.oninput = menuSave;
+    el.onchange = menuSave;  // 个别浏览器 select/checkbox 不发 input，兜一层
+  }
+  return tr;
+}
+
+async function load(){
+  $('#rows').innerHTML = '<tr><td colspan="6" class="hint">加载中…</td></tr>';
+  const gs = pick(await act({action:'list_all_settings'}), 'galleries') || [];
+  const tb = $('#rows');
+  tb.innerHTML = '';
+  for (const g of gs) tb.appendChild(row(g));
+  if (!gs.length) tb.innerHTML = '<tr><td colspan="6" class="hint">还没有图库，先在「图库管理」里创建一个。</td></tr>';
+}
+
+whenBridge()
+  .then(async b => {
+    B = b;
+    if (B.ready) await Promise.race([B.ready(), new Promise(r => setTimeout(r, 5000))]);
+    await load();
+  })
+  .catch(fail);
+</script>
+</body>
+</html>
