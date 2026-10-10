@@ -5,7 +5,7 @@
     "default": false
   },
   "watermark": {
-    "description": "发送时在图片下方附加信息条：图片主色块 + 文件名/PID + pixiv 作品二维码（仅发送环节生成，不修改原图，GIF 直接原样发送）。字体可在 WebUI 管理页的「水印设置」里调整。",
+    "description": "发送时在图片下方附加信息条：图片主色块 + 角色名称/文件名/PID + pixiv 作品二维码（仅发送环节生成，不修改原图，GIF 直接原样发送）。字体可在 WebUI 管理页的「水印设置」里调整。",
     "type": "bool",
     "default": true
   },

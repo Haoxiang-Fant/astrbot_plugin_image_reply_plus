@@ -9,6 +9,9 @@
 :root{--bg:#f6f7f8;--fg:#1a1a1a;--panel:#fff;--line:#dcdcdc;--ctrl:#fff;--ctrl-hover:#f0f0f0;--sub:#777;--pid:#456;--err:#c0392b;--warn:#e67e22;--head:64px}
 [data-theme="dark"]{--bg:#111;--fg:#eee;--panel:#161616;--line:#3a3a3a;--ctrl:#1c1c1c;--ctrl-hover:#2b2b2b;--sub:#888;--pid:#9ab;--err:#e74c3c;--warn:#e67e22}
 body{font-family:system-ui,"Microsoft YaHei",sans-serif;max-width:1200px;margin:24px auto;padding:0 12px;background:var(--bg);color:var(--fg)}
+/* 除输入框外禁止鼠标选中（拖动/连点不会把界面文字刷蓝）；输入框与文本域照常可选 */
+body{user-select:none;-webkit-user-select:none}
+input,textarea{user-select:text;-webkit-user-select:text}
 h2{display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:5;background:var(--bg)}
 h2 small{color:var(--sub);font-weight:normal;font-size:13px}
 h3{margin:0 0 10px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
@@ -27,6 +30,12 @@ button{cursor:pointer}button:hover,.up:hover,select:hover{background:var(--ctrl-
 @media (max-width:640px){#list{grid-template-columns:1fr}}
 .gal{cursor:pointer;margin-bottom:0;padding:0;display:flex;flex-direction:column;overflow:hidden;aspect-ratio:1}
 .gal:hover{border-color:var(--sub)}
+/* 颜色标签（0.2.1）：卡片边框随标签色（JS 写 inline border-color），名称下方一行小字；
+   封面右下角悬停出「标签」按钮（不进 ops 行，正方形卡片 ops 行塞不下第四件，见 D15） */
+.gal .tagline{padding:0 12px 8px;font-size:12px;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gal .cover{position:relative}
+.gal .tagbtn{display:none;position:absolute;right:8px;bottom:8px;padding:3px 9px;font-size:12px}
+.gal:hover .tagbtn{display:block}
 .gal .name{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:10px 12px 8px}
 .gal .name>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gal .name small{white-space:nowrap}
@@ -58,6 +67,8 @@ button{cursor:pointer}button:hover,.up:hover,select:hover{background:var(--ctrl-
 .item.sel img{outline:3px solid var(--warn);outline-offset:-3px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:9}
 .modal[hidden]{display:none}
+/* 弹窗开着时锁住背后页面的滚动（遮罩本来就挡点击；不支持 :has 的老浏览器只是少了滚动锁） */
+body:has(.modal:not([hidden])){overflow:hidden}
 .mbox{background:var(--panel);border:1px solid var(--line);padding:16px;width:min(420px,92vw)}
 #m-pid{width:100%;box-sizing:border-box}
 /* 点缩略图看大图：整屏遮罩，点任意处关闭 */
@@ -84,6 +95,9 @@ progress::-moz-progress-bar{background:var(--sub)}
 #up-float{position:fixed;top:10px;right:10px;z-index:99;background:var(--panel);border:1px solid var(--line);padding:8px 12px;font-size:13px;max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #up-float[hidden]{display:none}
 #up-float div{margin:2px 0}
+/* 右下角操作通知：3 秒自动消失；容器不挡鼠标，新的在最下面（贴近角落），旧的往上顶 */
+#toasts{position:fixed;right:12px;bottom:12px;z-index:99;display:flex;flex-direction:column;align-items:flex-end;pointer-events:none}
+#toasts div{background:var(--panel);border:1px solid var(--line);box-shadow:0 4px 16px rgba(0,0,0,.25);padding:8px 12px;font-size:13px;margin-top:6px;max-width:70vw;word-break:break-all}
 /* 悬停缩略图 1 秒的未裁剪大图 + 信息（参考样式：左图右信息；底色=主色淡化90%）；
    pointer-events:none 不挡鼠标 */
 #peek{position:fixed;z-index:60;width:376px;max-width:94vw;background:var(--panel);border:1px solid var(--line);padding:10px;font-size:12px;display:none;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.25);gap:10px}
@@ -121,6 +135,16 @@ textarea{font-family:inherit;resize:vertical}
 #batch-tbl th{color:var(--sub);font-weight:normal;font-size:13px;white-space:nowrap}
 #batch-tbl td input[type=text],#batch-tbl td select{width:100%;box-sizing:border-box}
 #batch-tbl td.ctr{text-align:center}
+/* 标签弹窗（0.2.1）：打标弹窗 = 色点+名称的按钮列表；管理弹窗 = 每行 名称+七色色板+删除 */
+.taglist{display:flex;flex-wrap:wrap;gap:8px}
+.taglist .tp{display:flex;align-items:center;gap:6px}
+.taglist .tp i{width:14px;height:14px;display:inline-block;flex:none}
+.taglist .tp.cur{border-color:var(--fg);font-weight:bold}
+.tagrow{display:flex;gap:8px;align-items:center;margin:8px 0}
+.tagrow .tname{flex:1;min-width:0}
+.tagrow .swatches{display:flex;gap:4px;flex:none}
+.tagrow .sw{width:24px;height:24px;padding:0;border:2px solid transparent}
+.tagrow .sw.cur{border-color:var(--fg)}
 /* 常驻头部：页头 sticky；一级页的建库栏跟在其下 sticky 成第二行；
    二级/批量卡片限高不超窗口，操作栏钉在卡顶，图片/表格在卡内滚动，表头钉在滚动区顶 */
 #view-main>.bar{position:sticky;top:var(--head);z-index:4;background:var(--bg)}
@@ -136,6 +160,7 @@ textarea{font-family:inherit;resize:vertical}
   <button id="btn-import" onclick="run(showImport)">批量导入</button>
   <button id="btn-menu" onclick="run(showMenu)">菜单预览</button>
   <button id="btn-wm" onclick="run(showWm)">水印设置</button>
+  <button id="btn-runtime" onclick="run(showRuntime)">运行设置</button>
   <button id="btn-batch" onclick="run(showBatch)">批量设置</button>
   <button id="btn-back" onclick="run(showMain)" hidden>返回图库列表</button>
 </h2>
@@ -145,6 +170,7 @@ textarea{font-family:inherit;resize:vertical}
   <div class="bar">
     <input id="kw" placeholder="新关键词，如：可琳照片">
     <button onclick="run(create)">创建关键词</button>
+    <button id="btn-tags" onclick="run(showTagMgr)">标签管理</button>
   </div>
   <div id="list">加载中…</div>
   <div id="sentinel-g" class="sentinel"></div>
@@ -159,6 +185,7 @@ textarea{font-family:inherit;resize:vertical}
       <button id="gal-up-btn" class="up">＋上传图片</button>
       <label class="up" title="发送该图库图片时是否附加信息条（默认开启）"><input type="checkbox" id="gal-wm"> 水印</label>
       <button id="gal-menu-btn">菜单设置</button>
+      <button id="gal-ren" title="改触发词：图库内图片同步改名">重命名</button>
       <button id="gal-del">删除图库</button>
       <span class="spacer"></span>
       <button id="cols-btn" title="每行张数 3~8 循环切换">每行 7 张</button>
@@ -218,8 +245,8 @@ textarea{font-family:inherit;resize:vertical}
   <div class="g">
     <h3>水印字体</h3>
     <div class="bar">
-      <label>中文字体 <select id="wm-cjk"></select></label>
-      <label>西文/数字字体 <select id="wm-latin"></select></label>
+      <label>中文字体 <input id="wm-cjk" list="wm-font-dl" spellcheck="false" autocomplete="off"></label>
+      <label>西文/数字字体 <input id="wm-latin" list="wm-font-dl" spellcheck="false" autocomplete="off"></label>
       <label class="up">＋上传字体文件<input type="file" id="wm-font-file" accept=".ttf,.ttc,.otf" hidden></label>
     </div>
     <div class="hint">
@@ -233,15 +260,33 @@ textarea{font-family:inherit;resize:vertical}
   </div>
 </div>
 
+<!-- 运行设置 -->
+<div id="view-runtime" hidden>
+  <div class="g">
+    <h3>运行设置 <small id="runtime-stat"></small></h3>
+    <div class="bar">
+      <label>默认发送张数 <input id="rt-count" type="number" min="1" max="5" step="1"></label>
+      <label>合并转发起始张数 <input id="rt-forward" type="number" min="2" max="10" step="1"></label>
+    </div>
+    <div class="hint">没有在指令末尾填写数字时使用默认发送张数；单次指令最多发送 10 张。达到合并转发起始张数后，会用合并转发发送。</div>
+    <h3>同义词</h3>
+    <div class="hint">一行一个规则：左侧标准词，右侧用逗号分隔同义词。例如：照片 = 图片,相片。</div>
+    <div id="syn-rows"></div>
+    <button id="syn-add">＋添加同义词规则</button>
+    <button id="rt-save">保存运行设置</button>
+    <div id="runtime-result"></div>
+  </div>
+</div>
+
 <!-- 批量设置：所有图库一行一个，改动即存。与 pages/settings 独立页同款表格；
      bridge 的鉴权上下文由父页面只在加载时发一次，location.href 跳到别的 Page 会收不到
      （ready() 挂起 → API 未授权），所以表在这里内置一份，不能跳转过去 -->
 <div id="view-batch" hidden>
   <div class="g">
-    <h3><span>图库批量设置</span><small id="batch-stat"></small><button onclick="run(loadBatch)">刷新</button></h3>
+    <h3><span>图库批量设置</span><small id="batch-stat"></small><span class="spacer"></span><button onclick="run(syncNames)">文件名同步</button><button onclick="run(loadBatch)">刷新</button></h3>
     <div id="batch-scroll">
       <table id="batch-tbl">
-        <thead><tr><th>图库</th><th>张数</th><th>水印</th><th>进菜单</th><th>角色名称</th><th>分组</th></tr></thead>
+        <thead><tr><th>图库</th><th>张数</th><th>水印</th><th>标签</th><th>进菜单</th><th>角色名称</th><th>分组</th></tr></thead>
         <tbody id="batch-rows"></tbody>
       </table>
     </div>
@@ -293,10 +338,8 @@ textarea{font-family:inherit;resize:vertical}
     <h3>菜单设置 <small id="mm-gal"></small></h3>
     <label class="fld"><input type="checkbox" id="mm-show"> 在「图片帮助」菜单里显示这个图库</label>
     <label class="fld">角色名称（菜单里显示为 角色名称-关键词）<input id="mm-char" spellcheck="false"></label>
-    <label class="fld">所属分组
-      <select id="mm-group">
-        <option>个人</option><option>团体</option><option>功能</option>
-      </select>
+    <label class="fld">所属分组（点右侧箭头展开选择，或直接输入筛选）
+      <input id="mm-group" list="group-dl" spellcheck="false" autocomplete="off">
     </label>
     <div class="bar" style="margin:12px 0 0">
       <button id="mm-ok">保存</button>
@@ -305,16 +348,33 @@ textarea{font-family:inherit;resize:vertical}
   </div>
 </div>
 
-<!-- 批量移动/复制目标选择 -->
+<!-- 批量移动/复制目标选择：选现有图库，或直接填名字新建一个 -->
 <div id="xfer-modal" class="modal" hidden>
   <div class="mbox">
     <h3><span id="xfer-title"></span> <small id="xfer-n"></small></h3>
-    <label class="fld">目标图库
-      <select id="xfer-dst"></select>
+    <label class="fld">目标图库（点右侧箭头展开选择，或直接输入筛选）
+      <input id="xfer-dst" list="xfer-dl" spellcheck="false" autocomplete="off">
+    </label>
+    <label class="fld">或新建图库（填了就优先用它）
+      <input id="xfer-new" placeholder="新图库名，如：新收集" spellcheck="false">
     </label>
     <div class="bar" style="margin:12px 0 0">
       <button id="xfer-ok">确定</button>
       <button id="xfer-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 图库改名（触发词）：文件夹与内部图片一起改名，pid/水印/菜单/标签设置都保留；双击弹窗外部关闭 -->
+<div id="rename-modal" class="modal" hidden>
+  <div class="mbox">
+    <h3>重命名图库 <small id="rn-old"></small></h3>
+    <label class="fld">新触发词（群发这个词出图；图库内图片会同步改名为 新词-编号.扩展名）
+      <input id="rn-name" spellcheck="false">
+    </label>
+    <div class="bar" style="margin:12px 0 0">
+      <button id="rn-ok">保存</button>
+      <button id="rn-cancel">取消</button>
     </div>
   </div>
 </div>
@@ -332,8 +392,27 @@ textarea{font-family:inherit;resize:vertical}
   </div>
 </div>
 
-<!-- 点缩略图看高清大图（点任意处关闭） -->
-<div id="viewer" class="modal" hidden><img id="viewer-img" alt=""></div>
+<!-- 点缩略图看高清大图（双击图片外关闭） -->
+<div id="viewer" class="modal" hidden title="双击图片外的任意处关闭"><img id="viewer-img" alt=""></div>
+
+<!-- 颜色标签：给单个图库打标（主页卡片封面右下角的「标签」按钮进入）；双击弹窗外部关闭 -->
+<div id="tagpick-modal" class="modal" hidden>
+  <div class="mbox">
+    <h3>设置标签 <small id="tp-gal"></small></h3>
+    <div id="tp-list" class="taglist"></div>
+    <p class="hint" style="margin:10px 0 0">要新建标签或改名字、换颜色？点主界面顶部的「标签管理」。</p>
+  </div>
+</div>
+
+<!-- 标签管理：命名 + 七种预设色取色；双击弹窗外部关闭 -->
+<div id="tags-modal" class="modal" hidden>
+  <div class="mbox">
+    <h3>标签管理 <button id="tag-add">＋新建标签</button></h3>
+    <div id="tag-rows"></div>
+    <p class="err" id="tag-err" hidden></p>
+    <p class="hint" style="margin:10px 0 0">颜色固定为七种预设低饱和度色，名字由你定（不重名）；删掉的标签会自动从各图库摘除。</p>
+  </div>
+</div>
 
 <!-- 上传弹窗：只有右上角 ✕ 能关；关窗不停止上传，右上角悬浮窗继续显示动态 -->
 <div id="up-modal" class="modal" hidden>
@@ -359,11 +438,21 @@ textarea{font-family:inherit;resize:vertical}
 <!-- 关窗后仍在进行的上传：页面右上角简要动态 -->
 <div id="up-float" hidden></div>
 
+<!-- 操作通知：右下角弹出，3 秒自动消失（删除/移动/复制/改名/同步等） -->
+<div id="toasts"></div>
+
 <!-- 悬停缩略图出的未裁剪大图预览 + 信息 -->
 <div id="peek"></div>
 
 <!-- 菜单页字体快速查找的候选列表（内容由脚本按可用字体填充） -->
 <datalist id="menu-fonts"></datalist>
+<!-- 水印字体候选（文件名，保存校验认的就是文件名） -->
+<datalist id="wm-font-dl"></datalist>
+<!-- 移动/复制目标图库候选 -->
+<datalist id="xfer-dl"></datalist>
+<!-- 打标用标签名候选 / 分组候选（静态三值） -->
+<datalist id="tag-dl"></datalist>
+<datalist id="group-dl"><option>个人</option><option>团体</option><option>功能</option></datalist>
 
 <script>
 "use strict";
@@ -380,6 +469,28 @@ function fail(e){
 }
 window.onerror = (m) => { fail(m); };
 window.addEventListener('unhandledrejection', e => fail(e.reason));
+
+// 右下角操作通知（删除/移动/复制/改名/同步等没有就地反馈的操作都用它）
+// 进行中那条【不自动消失】，必须由 toastDone 换成结果后才开始 3 秒倒计时——
+// 否则慢操作（移动上百张、大库同步）结束前提示就先过期，结果通知会打在已移除的节点上而看不见。
+// 只有「已…/失败」这类终态通知才自己 3 秒消失。
+function toast(msg){
+  const box = $('#toasts');
+  if (!box) return null;
+  const d = document.createElement('div');
+  d.textContent = msg;
+  box.appendChild(d);
+  d.timer = null;  // 等 toastDone 落地；没有配对调用时由 toastDone 的兜底清理
+  return d;
+}
+function toastDone(d, msg){
+  const box = $('#toasts');
+  if (!d || !box) return;
+  clearTimeout(d.timer);
+  if (!d.isConnected) box.appendChild(d);  // 极端情况下节点已不在容器里：补回来，结果不能丢
+  d.textContent = msg;
+  d.timer = setTimeout(() => d.remove(), 3000);
+}
 
 // 页头实高写入 --head：一级页建库栏的 sticky top 与二级/批量卡片限高都用它（窄屏按钮换行也算得对）
 const setHead = () => document.documentElement.style.setProperty('--head', Math.ceil($('h2').getBoundingClientRect().height) + 'px');
@@ -420,23 +531,58 @@ function showMain(){
   $('#view-wm').hidden = true;
   $('#view-menu').hidden = true;
   $('#view-batch').hidden = true;
+  $('#view-runtime').hidden = true;
   $('#view-main').hidden = false;
   $('#btn-import').hidden = false;
   $('#btn-menu').hidden = false;
   $('#btn-wm').hidden = false;
+  $('#btn-runtime').hidden = false;
   $('#btn-batch').hidden = false;
   $('#btn-back').hidden = true;
   $('#import-result').innerHTML = '';
-  if (S.mainDirty){  // 在别处改了列表内容（删库/上传完）：重拉并回顶
+  if (S.mainDirty){  // 在别处改了列表内容（删库/上传完/移动复制）：把已加载的页重拉，回离开时的位置
     S.mainDirty = false;
-    scrollTo(0, 0);
-    run(() => loadGalleries(true));
+    const want = S.off, top = S.mainScroll;
+    S.off = 0; S.total = null;
+    $('#list').innerHTML = '';
+    (async () => {
+      try {
+        let prev = -1;
+        while (S.off < want && S.off !== prev){ prev = S.off; await loadGalleries(); }
+        document.scrollingElement.scrollTop = top || 0;  // 补齐原翻页进度后停在原地，不回顶
+      } catch (e) { fail(e); }
+    })();
   } else if (S.mainScroll != null) {  // 原样回来：一级页面的内容、翻页进度、位置都不动
     document.scrollingElement.scrollTop = S.mainScroll;
   }
 }
+function showRuntime(){
+  $('#view-main').hidden = true; $('#view-import').hidden = true; $('#view-gallery').hidden = true;
+  $('#view-wm').hidden = true; $('#view-menu').hidden = true; $('#view-batch').hidden = true; $('#view-runtime').hidden = false;
+  $('#btn-import').hidden = true; $('#btn-menu').hidden = true; $('#btn-wm').hidden = true; $('#btn-runtime').hidden = true; $('#btn-batch').hidden = true; $('#btn-back').hidden = false;
+  run(loadRuntime);
+}
+let runtimeRules = [];
+function renderRuntimeRules(){
+  $('#syn-rows').innerHTML = runtimeRules.map((r, i) => `<div class="bar syn-row"><input class="syn-key" value="${esc(r[0])}" placeholder="标准词"><span>=</span><input class="syn-val" value="${esc(r[1].join(','))}" placeholder="图片,相片"><button data-i="${i}" class="syn-del">删除</button></div>`).join('');
+  for (const b of document.querySelectorAll('.syn-del')) b.onclick = () => { runtimeRules.splice(+b.dataset.i, 1); renderRuntimeRules(); };
+}
+async function loadRuntime(){
+  const r = await act({action:'get_runtime_settings'}); const d = r && r.data && r.data.send_count !== undefined ? r.data : r || {};
+  $('#rt-count').value = d.send_count || 1; $('#rt-forward').value = d.forward_threshold || 3;
+  runtimeRules = Object.entries(d.synonyms || {}).map(([k,v]) => [k, Array.isArray(v) ? v : String(v).split(',')]); renderRuntimeRules();
+}
+$('#syn-add').onclick = () => { runtimeRules.push(['', []]); renderRuntimeRules(); };
+$('#rt-save').onclick = () => run(async () => {
+  const synonyms = {};
+  for (const row of document.querySelectorAll('.syn-row')) { const k = row.querySelector('.syn-key').value.trim(); const vals = row.querySelector('.syn-val').value.split(',').map(x => x.trim()).filter(Boolean); if (k && vals.length) synonyms[k] = vals; }
+  await act({action:'save_runtime_settings', send_count: $('#rt-count').value, forward_threshold: $('#rt-forward').value, synonyms});
+  $('#runtime-stat').textContent = `已保存 ${new Date().toLocaleTimeString()}`; $('#runtime-result').innerHTML = '<p class="hint">运行设置已保存。</p>';
+});
+
 function showImport(){
   $('#view-main').hidden = true;
+  $('#view-runtime').hidden = true;
   $('#view-import').hidden = false;
   $('#view-menu').hidden = true;
   $('#btn-import').hidden = true;
@@ -458,15 +604,18 @@ function batchRow(g){
   const q = s => tr.querySelector(s);
   tr.innerHTML = `<td title="${esc(g.name)}">${esc(g.name)}</td><td>${g.count}</td>
     <td class="ctr"><input type="checkbox" class="wm"${g.wm ? ' checked' : ''}></td>
+    <td><input type="text" class="tagin" list="tag-dl" value="${esc(g.tag ? g.tag.name : '')}" placeholder="无标签" spellcheck="false" title="输入标签名或从候选选择；清空即去标签"></td>
     <td class="ctr"><input type="checkbox" class="show"${g.menu.show ? ' checked' : ''}></td>
     <td><input type="text" class="char" value="${esc(g.menu.char)}" spellcheck="false"></td>
-    <td><select class="group">${GROUPS.map(x => `<option${x === g.menu.group ? ' selected' : ''}>${x}</option>`).join('')}</select></td>`;
-  const stat = t => $('#batch-stat').textContent = `已保存 ${new Date().toLocaleTimeString()} ｜ ${t}`;
+    <td><input type="text" class="group" list="group-dl" value="${esc(g.menu.group)}" spellcheck="false"></td>`;
+  const stat = t => $('#batch-stat').textContent = `已保存 ${new Date().toLocaleTimeString()} ｜ ${t}`;  // 表头就地反馈，别再弹 toast 刷屏
   const menuSave = () => {
     clearTimeout(batchSavers.get(g.name));
     batchSavers.set(g.name, setTimeout(() => run(async () => {
+      let gv = q('.group').value.trim();  // 打错枚举外的值：退回原值不上送
+      if (!GROUPS.includes(gv)){ gv = g.menu.group; q('.group').value = gv; }
       await act({action:'set_gallery_menu', name:g.name, show:q('.show').checked,
-                 char:q('.char').value.trim(), group:q('.group').value});
+                 char:q('.char').value.trim(), group:gv});
       stat(g.name);
     }), 400));
   };
@@ -475,20 +624,43 @@ function batchRow(g){
     e.target.checked = pick(res, 'wm') !== false;  // 以服务端结果为准：没存上时勾选框回弹
     stat(g.name);
   });
-  for (const el of tr.querySelectorAll('.show,.char,.group')){
+  for (const el of tr.querySelectorAll('.show,.char')){
     el.oninput = menuSave;
-    el.onchange = menuSave;  // 个别浏览器 select/checkbox 不发 input，兜一层
+    el.onchange = menuSave;  // 个别浏览器 checkbox 不发 input，兜一层
   }
+  q('.group').onchange = menuSave;  // 分组走 change：输入中不打断，落定（回车/失焦）才校验
+  q('.tagin').onchange = e => run(async () => {   // 批量打标：按名找到标签即上送，清空即去标签
+    const v = e.target.value.trim();
+    const hit = Object.entries(TAGS).find(([, t]) => t.name === v);
+    if (v && !hit){ e.target.value = g.tag ? g.tag.name : ''; return; }  // 没打中任何标签：回弹不上送
+    const res = await act({action:'set_gallery_tag', name:g.name, tag: hit ? hit[0] : ''});
+    g.tag = pick(res, 'tag');
+    stat(g.name);
+  });
   return tr;
 }
 
 async function loadBatch(){
-  $('#batch-rows').innerHTML = '<tr><td colspan="6" class="hint">加载中…</td></tr>';
+  $('#batch-rows').innerHTML = '<tr><td colspan="7" class="hint">加载中…</td></tr>';
+  TAGS = pick(await act({action:'list_tags'}), 'tags') || {};  // 打标列的候选
+  fillTagDl();
   const gs = pick(await act({action:'list_all_settings'}), 'galleries') || [];
   const tb = $('#batch-rows');
   tb.innerHTML = '';
   for (const g of gs) tb.appendChild(batchRow(g));
-  if (!gs.length) tb.innerHTML = '<tr><td colspan="6" class="hint">还没有图库，先创建一个。</td></tr>';
+  if (!gs.length) tb.innerHTML = '<tr><td colspan="7" class="hint">还没有图库，先创建一个。</td></tr>';
+}
+
+// 文件名同步：不合「关键词-编号.扩展名」的图片统一改成规范名（pid/统计/设置都跟文件走）
+async function syncNames(){
+  const t = toast('正在同步文件名…');
+  const res = await act({action:'sync_names'});
+  const n = pick(res, 'changed') || 0;
+  $('#batch-stat').textContent =
+    `已同步 ${new Date().toLocaleTimeString()} ｜ ${n} 个文件改为规范名${n ? '，PID 与发送计数已跟着搬' : ''}`;
+  toastDone(t, n ? `文件名同步完成：${n} 个文件已重排为连续编号` : '文件名同步完成：所有文件名都已规范');
+  if (n) S.mainDirty = true;  // 目录 mtime 变了 → 主页封面种子过期；返回时按已加载页数重拉并停在原位
+  await loadBatch();
 }
 
 function showBatch(){
@@ -498,6 +670,7 @@ function showBatch(){
   $('#view-gallery').hidden = true;
   $('#view-wm').hidden = true;
   $('#view-menu').hidden = true;
+  $('#view-runtime').hidden = true;
   $('#view-batch').hidden = false;
   $('#btn-import').hidden = true;
   $('#btn-menu').hidden = true;
@@ -516,6 +689,7 @@ function showMenu(){
   $('#view-gallery').hidden = true;
   $('#view-wm').hidden = true;
   $('#view-menu').hidden = false;
+  $('#view-runtime').hidden = true;
   $('#btn-import').hidden = true;
   $('#btn-menu').hidden = true;
   $('#btn-wm').hidden = true;
@@ -635,12 +809,14 @@ async function openMenuCfg(name){
 }
 $('#gal-menu-btn').onclick = () => run(() => openMenuCfg(S.gal));
 $('#mm-ok').onclick = () => run(async () => {
+  const gv = $('#mm-group').value.trim();  // 输入框可能打出枚举外的值：不认的回落「个人」
+  const t = toast('正在保存菜单设置…');
   await act({action:'set_gallery_menu', name:mmGal, show:$('#mm-show').checked,
-             char:$('#mm-char').value.trim(), group:$('#mm-group').value});
+             char:$('#mm-char').value.trim(), group: GROUPS.includes(gv) ? gv : '个人'});
   $('#menu-modal').hidden = true;
+  toastDone(t, `已保存「${mmGal}」的菜单设置`);
 });
 $('#mm-cancel').onclick = () => { $('#menu-modal').hidden = true; };
-$('#menu-modal').onclick = e => { if (e.target.id === 'menu-modal') $('#menu-modal').hidden = true; };
 
 // ---------- 水印设置 ----------
 
@@ -649,6 +825,7 @@ function showWm(){
   $('#view-import').hidden = true;
   $('#view-gallery').hidden = true;
   $('#view-menu').hidden = true;
+  $('#view-runtime').hidden = true;
   $('#view-wm').hidden = false;
   $('#btn-import').hidden = true;
   $('#btn-menu').hidden = true;
@@ -662,18 +839,28 @@ async function loadWm(){
   const res = await act({action:'get_settings'});
   const fonts = pick(res, 'fonts') || {};
   const avail = pick(res, 'available') || [];
+  $('#wm-font-dl').innerHTML = avail.map(n => `<option value="${esc(n)}">`).join('');
   for (const [sel, key] of [['#wm-cjk','cjk'], ['#wm-latin','latin']]) {
     const cur = String(fonts[key] || '').toLowerCase();
     const el = $(sel);
-    el.innerHTML = avail.map(n =>
-      `<option value="${esc(n)}"${n.toLowerCase() === cur ? ' selected' : ''}>${esc(n)}</option>`).join('');
-    // 当前设置的字体已被卸载时补一项，避免保存时静默丢设置
-    if (cur && ![...el.options].some(o => o.value.toLowerCase() === cur))
-      el.insertAdjacentHTML('afterbegin', `<option value="${esc(fonts[key])}" selected>${esc(fonts[key])}（未安装）</option>`);
+    el.value = avail.find(n => n.toLowerCase() === cur) || String(fonts[key] || '');  // 已卸载的照显原名，换掉即存
+    el.dataset.last = el.value;
   }
 }
 async function saveWm(){
+  const dl = $('#wm-font-dl');
+  for (const id of ['#wm-cjk', '#wm-latin']){
+    const el = $(id);
+    if (![...dl.options].some(o => o.value === el.value)){  // 输错没打中任何字体：回弹不上送
+      el.value = el.dataset.last || '';
+      $('#wm-result').innerHTML = '<p class="err">字体名无效，请从候选里选或输入完整文件名。</p>';
+      return;
+    }
+    el.dataset.last = el.value;
+  }
+  const t = toast('正在保存水印字体…');
   await act({action:'save_settings', cjk: $('#wm-cjk').value, latin: $('#wm-latin').value});
+  toastDone(t, '水印字体已保存');
   $('#wm-result').innerHTML = '<p class="hint">已保存，对之后生成的信息条生效。</p>';
 }
 for (const sel of ['#wm-cjk', '#wm-latin']) $(sel).onchange = () => run(saveWm);  // 实时保存：改动即存
@@ -690,26 +877,48 @@ $('#wm-font-file').onchange = e => run(async () => {
 
 // 后端返回 {src:...}；老版本信封/裸字符串也兼容（bridge 会剥掉顶层 data 键）
 const extractSrc = p => typeof p === 'string' ? p : (p && (p.src ?? p.data)) || null;
-function fetchSrc(gal, file, size){
-  return act({action:'thumb', name:gal, image:file, size})
-    .then(p => extractSrc(p))
-    .then(src => src || Promise.reject(new Error('no thumb')))
-    .catch(() => act({action:'raw', name:gal, image:file}).then(p => extractSrc(p)));
+
+// 图片字节请求调度（0.2.1）：缩略图/预览走受限队列，列表与保存等数据请求直连，
+// 绝不排在缩略图后面——图库条目/图片条目的翻页加载不再被没加载完的预览图堵住。
+// 并发上限 4：给数据请求留连接；pri 大者先出队（悬停预览/大图 9 > 视口内交缩比 0~1 > 预载边缘 0）
+const IQ = {jobs: [], run: 0, MAX: 4};
+function iq(pri, fn){
+  return new Promise((ok, bad) => { IQ.jobs.push({pri: pri || 0, fn, ok, bad}); iqPump(); });
 }
-function loadThumb(img){
+function iqPump(){
+  while (IQ.run < IQ.MAX && IQ.jobs.length){
+    IQ.jobs.sort((a, b) => b.pri - a.pri);
+    const j = IQ.jobs.shift();
+    IQ.run++;
+    j.fn().then(j.ok, j.bad).finally(() => { IQ.run--; iqPump(); });
+  }
+}
+
+function fetchSrc(gal, file, size, pri){
+  return iq(pri, () =>
+    act({action:'thumb', name:gal, image:file, size})
+      .then(p => extractSrc(p))
+      .then(src => src || Promise.reject(new Error('no thumb')))
+      .catch(() => act({action:'raw', name:gal, image:file}).then(p => extractSrc(p)))
+  );
+}
+function loadThumb(img, pri){
   if (img.dataset.done) return;
   img.dataset.done = '1';
-  fetchSrc(img.dataset.g, img.dataset.f, img.dataset.s)
+  fetchSrc(img.dataset.g, img.dataset.f, img.dataset.s, pri)
     .then(src => { if (src) img.src = src; else throw new Error('empty'); })
     .catch(e => { console.error('缩略图加载失败', img.dataset.g, img.dataset.f, e);
                   img.classList.add('bad'); img.alt = '加载失败'; img.title = img.dataset.f; });
 }
 const io = ('IntersectionObserver' in window)
   ? new IntersectionObserver(es => {
-      for (const e of es) if (e.isIntersecting){ io.unobserve(e.target); loadThumb(e.target); }
+      for (const e of es) if (e.isIntersecting){
+        io.unobserve(e.target);
+        loadThumb(e.target, e.intersectionRatio);  // 交缩比当优先级：窗口正显示的先于 300px 预载边缘
+      }
     }, {rootMargin: '300px'})
   : null;
-const observeImg = img => io ? io.observe(img) : loadThumb(img);
+const observeImg = img => io ? io.observe(img) : loadThumb(img, 1);
 
 // ---------- 一级：图库列表（20/页，滑到底自动加载，也有加载按钮） ----------
 
@@ -719,6 +928,22 @@ const S = {off: 0, total: null, busyG: false, gal: null, ioff: 0, itotal: null, 
 let pinG = null;
 const inView = el => { const r = el.getBoundingClientRect(); return r.top < innerHeight && r.bottom > 0; };
 const moreBtn = (sel, text) => { const b = $(sel); b.hidden = !text; if (text) b.textContent = text; };
+
+// 卡片标签外观（0.2.1）：边框色随标签，名称下方一行小字；无标签恢复默认并去掉那一行
+function applyTag(card, t){
+  card.style.borderColor = t ? t.color : '';
+  card.dataset.tag = t ? t.id : '';
+  let line = card.querySelector('.tagline');
+  if (t){
+    if (!line){
+      line = document.createElement('div');
+      line.className = 'tagline';
+      card.querySelector('.name').after(line);
+    }
+    line.style.color = t.color;
+    line.textContent = `● ${t.name}`;
+  } else if (line) line.remove();
+}
 
 function galRow(g){
   const d = document.createElement('div');
@@ -738,9 +963,11 @@ function galRow(g){
   wm.checked = g.wm !== false;                    // 缺省开
   wm.onchange = e => run(async () => {            // 主界面直接开关；顺手更新内存值，进二级页时勾选态才对
     g.wm = e.target.checked;
+    const t = toast(g.wm ? `正在开启「${g.name}」的水印…` : `正在关闭「${g.name}」的水印…`);
     const res = await act({action: 'set_wm', name: g.name, enabled: g.wm});
     g.wm = pick(res, 'wm') !== false;  // 以服务端保存结果为准：没存上时勾选框回弹，错觉变可见
     wm.checked = g.wm;
+    toastDone(t, `「${g.name}」水印已${g.wm ? '开启' : '关闭'}`);
   });
   const cover = d.querySelector('.cover');
   if (g.cover){  // 随机封面由后端每次列表挑一张，进视口才请求
@@ -753,6 +980,13 @@ function galRow(g){
     cover.className += ' empty';
     cover.textContent = '暂无图片';
   }
+  const tagBtn = document.createElement('button');  // 封面右下角：设置颜色标签（0.2.1）
+  tagBtn.className = 'tagbtn';
+  tagBtn.title = '设置颜色标签';
+  tagBtn.textContent = '🏷 标签';
+  tagBtn.onclick = e => { e.stopPropagation(); run(() => openTagPick(g.name, d)); };
+  cover.appendChild(tagBtn);
+  applyTag(d, g.tag);
   return d;
 }
 
@@ -815,6 +1049,7 @@ async function openGallery(name, wm){
   $('#view-wm').hidden = true;
   $('#view-menu').hidden = true;
   $('#view-gallery').hidden = false;
+  $('#view-runtime').hidden = true;
   $('#btn-import').hidden = true;
   $('#btn-menu').hidden = true;
   $('#btn-wm').hidden = true;
@@ -837,8 +1072,7 @@ function imgItem(gal, im){
   img.dataset.g = gal; img.dataset.f = im.file;
   img.dataset.s = cols <= 4 ? 640 : 320;  // 列少图大取 640 档保清晰，其余 320（后端收敛到 80~1600）
   // 提示不设 title（会跟悬停信息框重复）；"点击查看大图" 合并在信息框里
-  img.onmouseenter = () => {  // 悬停 1 秒：缩略图旁边浮出未裁剪大图与信息，移开即收
-    if (S.selMode) return;
+  img.onmouseenter = () => {  // 悬停 1 秒：缩略图旁边浮出未裁剪大图与信息，移开即收（选择模式下同样可用）
     hidePeek();
     peekTimer = setTimeout(() => showPeek(gal, im.file, img), 1000);
   };
@@ -875,7 +1109,8 @@ function showPeek(gal, file, el){
   p.style.left = left + 'px';
   p.style.top = Math.max(8, Math.min(r.top, innerHeight - 420)) + 'px';
   p.style.display = 'flex';
-  act({action:'wm_preview', name:gal, image:file, size:800}).then(res => {  // 发送时带水印的真实效果
+  const clickHint = () => S.selMode ? '单击缩略图选中／取消选中' : '单击缩略图可以查看大图';
+  iq(9, () => act({action:'wm_preview', name:gal, image:file, size:800})).then(res => {  // 悬停图片=最高优先
     if (peekKey !== key) return;
     const src = extractSrc(res);
     if (!src) return;
@@ -894,11 +1129,11 @@ function showPeek(gal, file, el){
       `<div><b>UID</b><span>${esc(pick(res, 'uid') || '无')}${pick(res, 'pid') ? '（PID ' + esc(pick(res, 'pid')) + '）' : ''}</span></div>` +
       `<div><b>发送次数</b><span>${pick(res, 'sends') || 0} 次</span></div>` +
       `<div><b>位置</b><span>${esc(pick(res, 'path') || '')}</span></div>` +
-      `<div class="hint" style="margin:4px 0 0;color:#777">单击缩略图可以查看大图</div>`;
+      `<div class="hint" style="margin:4px 0 0;color:#777">${clickHint()}</div>`;
   }).catch(() => {
     if (peekKey !== key) return;
     const info = p.querySelector('.pk-info');
-    if (info) info.innerHTML = '<div class="hint" style="margin:0">单击缩略图可以查看大图</div>';
+    if (info) info.innerHTML = `<div class="hint" style="margin:0">${clickHint()}</div>`;
   });
 }
 
@@ -908,10 +1143,25 @@ async function viewBig(gal, file){
   box.hidden = false;
   const img = $('#viewer-img');
   img.removeAttribute('src');  // 先清上一张，避免看着旧图等新图
-  const src = await fetchSrc(gal, file, 1600);
+  const src = await fetchSrc(gal, file, 1600, 9);
   if (src) img.src = src;
 }
-$('#viewer').onclick = () => { $('#viewer').hidden = true; $('#viewer-img').removeAttribute('src'); };
+
+// 弹窗关闭规则（0.2.1）：框内按下拖到遮罩上松开不算关（按下处必须在遮罩上），
+// 且要双击遮罩才关；上传弹窗标明只能点 ✕，不接这条
+function modalBackdrop(el, onClose){
+  let downOutside = false;
+  el.addEventListener('mousedown', e => { downOutside = e.target === el; });
+  el.addEventListener('dblclick', e => {
+    if (downOutside && e.target === el){ downOutside = false; onClose(); }
+  });
+}
+modalBackdrop($('#viewer'), () => { $('#viewer').hidden = true; $('#viewer-img').removeAttribute('src'); });
+modalBackdrop($('#menu-modal'), () => { $('#menu-modal').hidden = true; });
+modalBackdrop($('#xfer-modal'), () => { $('#xfer-modal').hidden = true; });
+modalBackdrop($('#modal'), () => { $('#modal').hidden = true; });
+modalBackdrop($('#tagpick-modal'), () => { $('#tagpick-modal').hidden = true; });
+modalBackdrop($('#tags-modal'), () => { $('#tags-modal').hidden = true; });
 
 // PID 弹窗：保存后就地更新标签，不整页刷新
 function editPid(gal, im, pidEl){
@@ -920,19 +1170,22 @@ function editPid(gal, im, pidEl){
   $('#m-pid').value = im.pid || '';
   $('#m-pid').focus();
   $('#m-ok').onclick = () => run(async () => {
+    const t = toast('正在保存 PID…');
     const res = await act({action:'set_pid', name:gal, image:im.file, pid:$('#m-pid').value.trim()});
     im.pid = pick(res, 'pid') || null;
     pidEl.textContent = im.pid ? 'PID:' + im.pid : '无PID';
     pidEl.title = im.pid || '';
     $('#modal').hidden = true;
+    toastDone(t, im.pid ? `PID 已保存：${im.pid}` : '已清除 PID');
   });
 }
 $('#m-cancel').onclick = () => { $('#modal').hidden = true; };
-$('#modal').onclick = e => { if (e.target.id === 'modal') $('#modal').hidden = true; };
 $('#m-pid').onkeydown = e => { if (e.key === 'Enter') $('#m-ok').click(); };
 $('#gal-wm').onchange = e => run(async () => {
+  const t = toast(e.target.checked ? `正在开启「${S.gal}」的水印…` : `正在关闭「${S.gal}」的水印…`);
   const res = await act({action:'set_wm', name:S.gal, enabled:e.target.checked});
   e.target.checked = pick(res, 'wm') !== false;  // 与服务端同步，写失败时回弹
+  toastDone(t, `「${S.gal}」水印已${e.target.checked ? '开启' : '关闭'}`);
 });
 
 async function loadImages(reset){
@@ -963,11 +1216,12 @@ async function loadImages(reset){
 async function create(){
   const name = $('#kw').value.trim();
   if (!name) { fail('请先输入关键词'); return; }
+  const t = toast(`正在创建图库「${name}」…`);
   const res = await act({action: 'create', name});
   $('#kw').value = '';
   pinG = {name: pick(res, 'name') || name, count: 0, wm: true, cover: null};  // 新建的库置顶，刷新页面后回正常排序
-  await loadGalleries(true);
-}
+  toastDone(t, `已创建图库「${pinG.name}」`);
+  await loadGalleries(true);}
 
 const readB64 = f => new Promise((ok, err) => {
   const r = new FileReader();
@@ -1152,13 +1406,17 @@ function armed(btn, text){
 
 async function delI(name, image, btn){
   if (!armed(btn, '确认删除?')) return;
+  const t = toast(`正在删除「${image}」…`);
   await act({action: 'delete_image', name, image});
+  toastDone(t, `已删除「${image}」`);
   await loadImages(true);
 }
 
 async function delG(name, btn){
   if (!armed(btn, '确认删除图库?')) return;
+  const t = toast(`正在删除图库「${name}」…`);
   await act({action: 'delete', name});
+  toastDone(t, `已删除图库「${name}」`);
   S.mainDirty = true;  // 一级页面的卡片已经过期
   if (pinG && pinG.name === name) pinG = null;  // 置顶的库没了，别留幽灵卡片
   if (S.gal === name) await showMain();         // 从二级页删的：showMain 里重拉并回顶
@@ -1180,7 +1438,10 @@ function applyCols(n){
 $('#cols-btn').onclick = () => {
   applyCols(cols >= 8 ? 3 : cols + 1);
   colsTouched = true;  // 本会话不再吃服务端回传的旧值
-  act({action:'save_settings', cols}).catch(fail);  // 记住偏好（settings.json，即发即忘）
+  const t = toast(`每行 ${cols} 张（本会话）`);
+  act({action:'save_settings', cols})
+    .then(() => toastDone(t, `每行 ${cols} 张已记住`))
+    .catch(e => { toastDone(t, '每行张数保存失败'); fail(e); });
 };
 
 function setSelMode(on){
@@ -1203,9 +1464,11 @@ function toggleSel(it, file){
 $('#sel-del').onclick = e => run(async () => {
   if (!S.sel.size) return;
   if (!armed(e.target, '确认删除?')) return;
+  const n = S.sel.size;
+  const t = toast(`正在删除 ${n} 张…`);
   const res = await act({action:'batch', op:'delete', src:S.gal, images:[...S.sel]});
   const bad = pick(res, 'failed') || [];
-  $('#gal-result').innerHTML = `<p class="hint">已删除 ${pick(res,'done')||0} 张${bad.length ? `，${bad.length} 张失败` : ''}</p>`;
+  toastDone(t, `已删除 ${pick(res,'done')||0}/${n} 张${bad.length ? `，${bad.length} 张失败` : ''}`);
   setSelMode(false);
   S.mainDirty = true;  // 张数/封面可能变了
   await loadImages(true);
@@ -1218,27 +1481,163 @@ async function openXfer(op){
   $('#xfer-title').textContent = op === 'move' ? '移动到' : '复制到';
   $('#xfer-n').textContent = `选中 ${S.sel.size} 张，目标图库：`;
   const res = await act({action:'list_all_settings'});
-  $('#xfer-dst').innerHTML = (pick(res, 'galleries') || [])
+  $('#xfer-dl').innerHTML = (pick(res, 'galleries') || [])
     .filter(g => g.name !== S.gal)
-    .map(g => `<option>${esc(g.name)}</option>`).join('');
+    .map(g => `<option value="${esc(g.name)}">`).join('');
+  $('#xfer-dst').value = '';
+  $('#xfer-new').value = '';
   $('#xfer-modal').hidden = false;
 }
 $('#sel-move').onclick = () => run(() => openXfer('move'));
 $('#sel-copy').onclick = () => run(() => openXfer('copy'));
 $('#xfer-cancel').onclick = () => { $('#xfer-modal').hidden = true; };
-$('#xfer-modal').onclick = e => { if (e.target.id === 'xfer-modal') $('#xfer-modal').hidden = true; };
 $('#xfer-ok').onclick = () => run(async () => {
-  const dst = $('#xfer-dst').value;
-  if (!dst) return;
+  let dst = $('#xfer-dst').value.trim();
+  const nn = $('#xfer-new').value.trim();
+  const t = toast(`正在${xferOp === 'move' ? '移动' : '复制'} ${S.sel.size} 张…`);
+  if (nn){  // 直接新建一个图库当目标（create 会清洗关键词并返回规范名）
+    dst = pick(await act({action:'create', name: nn}), 'name') || nn;
+  } else if (!dst || ![...$('#xfer-dl').options].some(o => o.value === dst)){
+    toastDone(t, '未选择目标图库');
+    fail('请先选择目标图库，或填一个新图库名');
+    return;
+  }
   const res = await act({action:'batch', op:xferOp, src:S.gal, dst, images:[...S.sel]});
   $('#xfer-modal').hidden = true;
   const bad = pick(res, 'failed') || [];
-  $('#gal-result').innerHTML =
-    `<p class="hint">已${xferOp === 'move' ? '移动' : '复制'} ${pick(res,'done')||0} 张` +
-    `${bad.length ? `，跳过 ${bad.length} 张（目标已有同名）` : ''}</p>`;
+  toastDone(t, `已${xferOp === 'move' ? '移动' : '复制'} ${pick(res,'done')||0} 张到「${dst}」` +
+        `${bad.length ? `，${bad.length} 张失败` : ''}，已按「${dst}-编号.扩展名」改名`);
   setSelMode(false);
   S.mainDirty = true;
   await loadImages(true);
+});
+
+// ---------- 图库改名（触发词）：文件夹/内部图片/pid/设置一起搬，回来主页停留在原位 ----------
+
+$('#gal-ren').onclick = () => {
+  $('#rn-old').textContent = S.gal;
+  $('#rn-name').value = S.gal;
+  $('#rename-modal').hidden = false;
+  $('#rn-name').focus();
+};
+$('#rn-cancel').onclick = () => { $('#rename-modal').hidden = true; };
+$('#rn-name').onkeydown = e => { if (e.key === 'Enter') $('#rn-ok').click(); };
+$('#rn-ok').onclick = () => run(async () => {
+  const old = S.gal, nn = $('#rn-name').value.trim();
+  if (!nn || nn === old){ $('#rename-modal').hidden = true; return; }
+  const t = toast(`正在把「${old}」改名为「${nn}」…`);
+  const res = await act({action:'rename', name: old, new_name: nn});
+  if (pick(res, 'status') === 'error'){  // 错误就地表：遮罩挡着时页面级错误框看不见
+    toastDone(t, '改名失败');
+    $('#gal-result').innerHTML = `<p class="err">${esc(pick(res, 'message') || '改名失败')}</p>`;
+    return;
+  }
+  S.gal = pick(res, 'name') || nn;
+  if (pinG && pinG.name === old) pinG.name = S.gal;  // 置顶卡跟着改名，别留幽灵卡
+  $('#gal-title').textContent = S.gal;
+  $('#rename-modal').hidden = true;
+  $('#gal-result').innerHTML = '';
+  toastDone(t, `已改名为「${S.gal}」，图库内图片同步改名`);
+  S.mainDirty = true;  // 主页卡片名/张数/封面已过期；返回时按已加载页数重拉并停在原位
+  await loadImages(true);
+});
+modalBackdrop($('#rename-modal'), () => { $('#rename-modal').hidden = true; });
+
+// ---------- 颜色标签（0.2.1）：卡片打标 / 标签管理 / 批量设置打标 ----------
+
+let TAGS = {};     // 标签 id → {name, color}；打标弹窗与批量页打开时从服务端刷新
+let TAGC = [];     // 预设七色（服务端下发，前端不自己写死第二份）
+let tpCtx = null;  // 打标弹窗当前针对的 {gal, card}
+
+async function openTagPick(gal, card){
+  tpCtx = {gal, card};
+  $('#tp-gal').textContent = gal;
+  const res = await act({action:'list_tags'});
+  TAGS = pick(res, 'tags') || {};
+  TAGC = pick(res, 'colors') || [];
+  const cur = card.dataset.tag || '';
+  $('#tp-list').innerHTML =
+    `<button class="tp${cur ? '' : ' cur'}" data-id="">无标签</button>` +
+    Object.entries(TAGS).map(([id, t]) =>
+      `<button class="tp${id === cur ? ' cur' : ''}" data-id="${esc(id)}">` +
+      `<i style="background:${esc(t.color)}"></i>${esc(t.name || '(未命名)')}</button>`).join('');
+  $('#tagpick-modal').hidden = false;
+}
+$('#tp-list').onclick = e => {
+  const b = e.target.closest('button.tp');
+  if (!b || !tpCtx) return;
+  run(async () => {
+    const t = toast('正在设置标签…');
+    const res = await act({action:'set_gallery_tag', name: tpCtx.gal, tag: b.dataset.id || ''});
+    const tag = pick(res, 'tag');
+    applyTag(tpCtx.card, tag);  // 卡片就地更新，不重拉列表
+    $('#tagpick-modal').hidden = true;
+    toastDone(t, tag ? `「${tpCtx.gal}」已打上标签「${tag.name}」` : `已去掉「${tpCtx.gal}」的标签`);
+  });
+};
+
+// 把当前标签填进批量设置页的打标候选
+function fillTagDl(){
+  $('#tag-dl').innerHTML = Object.values(TAGS).map(t => `<option value="${esc(t.name)}">`).join('');
+}
+
+function showTagMgr(){
+  $('#tags-modal').hidden = false;
+  run(loadTagMgr);
+}
+
+async function loadTagMgr(){
+  $('#tag-err').hidden = true;
+  const res = await act({action:'list_tags'});
+  TAGS = pick(res, 'tags') || {};
+  TAGC = pick(res, 'colors') || [];
+  fillTagDl();
+  const box = $('#tag-rows');
+  box.innerHTML = '';
+  if (!Object.keys(TAGS).length)
+    box.innerHTML = '<p class="hint" style="margin:4px 0">还没有标签，点「＋新建标签」创建一个。</p>';
+  for (const [id, t] of Object.entries(TAGS)){
+    const row = document.createElement('div');
+    row.className = 'tagrow';
+    row.innerHTML =
+      `<input class="tname" value="${esc(t.name)}" maxlength="24" spellcheck="false" title="标签名称">` +
+      `<span class="swatches">${TAGC.map(c =>
+        `<button class="sw${c === t.color ? ' cur' : ''}" data-c="${c}" style="background:${c}" title="${c}"></button>`).join('')}</span>` +
+      `<button class="tdel">删除</button>`;
+    const save = color => run(async () => {
+      const t = toast('正在保存标签…');
+      const r = await act({action:'save_tag', id, name: row.querySelector('.tname').value.trim(),
+                           color: color || row.querySelector('.sw.cur').dataset.c});
+      if (pick(r, 'status') === 'error'){  // 错误就地显示在弹窗里（遮罩挡住了页面上的错误框）
+        toastDone(t, '标签保存失败');
+        $('#tag-err').textContent = pick(r, 'message') || '保存失败';
+        $('#tag-err').hidden = false;
+        return;
+      }
+      toastDone(t, '标签已保存');
+      await loadTagMgr();
+    });
+    row.querySelector('.tname').onchange = () => save();
+    for (const b of row.querySelectorAll('.sw')) b.onclick = () => save(b.dataset.c);
+    row.querySelector('.tdel').onclick = e => run(async () => {
+      if (!armed(e.target, '确认删除?')) return;
+      const t = toast('正在删除标签…');
+      await act({action:'delete_tag', id});
+      toastDone(t, `已删除标签「${TAGS[id] ? TAGS[id].name : id}」，相关图库已自动摘除`);
+      await loadTagMgr();
+    });
+    box.appendChild(row);
+  }
+}
+
+$('#tag-add').onclick = () => run(async () => {
+  const names = new Set(Object.values(TAGS).map(t => t.name));
+  let name = '新标签', i = 2;  // 重名会被后端拒：自动编号避开
+  while (names.has(name)) name = `新标签${i++}`;
+  const t = toast('正在新建标签…');
+  await act({action:'save_tag', name, color: TAGC[0] || ''});
+  toastDone(t, `已新建标签「${name}」，可直接改名字/换颜色`);
+  await loadTagMgr();
 });
 
 // ---------- 批量导入 ----------
