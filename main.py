@@ -29,6 +29,7 @@ import random
 import re
 import shutil
 import time
+import uuid
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -36,7 +37,11 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Image, Reply
+try:
+    from astrbot.api.message_components import Image, Node, Nodes, Reply
+except ImportError:  # 老版 AstrBot 没有转发组件时仍可逐张发送
+    from astrbot.api.message_components import Image, Reply
+    Node = Nodes = None
 from astrbot.api.star import Context, Star, StarTools, register
 
 try:  # 新版 AstrBot（FastAPI 时代）提供 astrbot.api.web
@@ -81,7 +86,7 @@ except ImportError:
             return {"status": "error", "message": message, "data": data or {}}
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
-PLUGIN_VERSION = "0.2.0"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PLUGIN_VERSION = "0.2.1"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
 PLUGIN_AUTHOR = "Haoxiang-Fant"  # 同上：@register 与 metadata.yaml 的 author 都用它
 PLUGIN_REPO = "https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus"
 PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
@@ -190,28 +195,36 @@ FONT_DIRS = [
     Path("/System/Library/Fonts/Supplemental"),
 ]
 
-# 水印条设计常量：均为"占信息条高度的占比"，来自参考样图逐像素测量。
-# 条高 = 图片高 × WM_BAR_FRAC，任何尺寸的图输出视觉比例一致。
-WM_BAR_FRAC = 0.08
+# 水印条设计常量：均为"占信息条高度的占比"，来自参考样图逐像素测量（0.2.1 重测）。
+# 条高 = 图片高 × WM_BAR_FRAC（0.08 的 110%），任何尺寸的图输出视觉比例一致。
+WM_BAR_FRAC = 0.088
 WM_BG = (246, 244, 236)      # 条底色（米白）
 WM_FG = (0, 0, 0)            # 文字/二维码
-WM_SQUARE = 0.49             # 主色方块边长
-WM_SQUARE_X = 0.303          # 方块左边距
-WM_TEXT_X = 0.942            # 文字左边距
-WM_TEXT1_SIZE = 0.2656       # 第一行（文件名）字号
-WM_TEXT2_SIZE = 0.2199       # 第二行（PID 行）字号
-WM_TEXT_LINE_GAP = 0.361     # 两行墨迹顶部的间距
-WM_QR_SIZE = 0.71            # 二维码边长
-WM_QR_RIGHT = 0.361          # 二维码右边距
+WM_GRAY = (148, 148, 147)    # 第一行尾部的文件名灰字
+WM_SQUARE = 0.383            # 主色方块边长
+WM_SQUARE_X = 0.237          # 方块左边距
+WM_TEXT_X = 0.737            # 文字左边距
+WM_TEXT1_SIZE = 0.2078       # 第一行（角色名）字号
+WM_GRAY_SIZE = 0.1558        # 第一行尾部（文件名灰字）字号
+WM_TEXT2_SIZE = 0.1721       # 第二行（PID 行）字号
+WM_TEXT_LINE_GAP = 0.2825    # 两行墨迹顶部的间距
+WM_QR_SIZE = 0.555           # 二维码边长
+WM_QR_RIGHT = 0.2825         # 二维码右边距
+WM_TEXT_GAP = 0.2            # 文字与二维码之间的最小空隙（无 pid 时右边距 0.3）
 WM_QR_URL = "https://www.pixiv.net/artworks/{pid}"
 WM_FALLBACK_COLOR = (103, 141, 134)  # 样图占位主色，提取不到饱和主色时兜底
-# 中日韩字符段（含全角标点/全角字母）→ 用中文字体绘制，其余交给西文字体
-CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f]+")
+# 中日韩字符段（含全角标点/全角字母/着重号·）→ 用中文字体绘制，其余交给西文字体
+CJK_RUN_RE = re.compile(r"[\u1100-\u11ff\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f\u00b7]+")
 
 # ---------------- 图库菜单设计常量（0.2.0）----------------
 # 下面所有数字都是参考样图上的实测像素（样图宽 MENU_REF_W），渲染时统一乘 宽度/MENU_REF_W；
 # 改版式只改这里的比例，别在渲染函数里写死像素。
 MENU_CMD = "图片帮助"                 # 群里触发菜单的指令名
+DEFAULT_SYNONYMS = {"照片": ("图片",)}
+DEFAULT_SEND_COUNT = 1
+DEFAULT_FORWARD_THRESHOLD = 3
+MAX_SEND_COUNT = 10
+MAX_CONFIG_SEND_COUNT = 5
 MENU_REF_W = 1752.0                   # 参考样图宽度（测量基准）
 MENU_WIDTH = 1200                     # 发送用菜单图宽度
 MENU_PREVIEW_W = 700                  # WebUI 预览宽度（小图省带宽，版式按比例一致）
@@ -284,6 +297,19 @@ MENU_BG_MAX_MB = 10                    # 顶部背景图大小上限
 MENU_BG_NAME = "menu_bg"               # 背景图文件名前缀（存插件数据目录根）
 MENU_SIZE_MIN, MENU_SIZE_MAX = 50, 200  # 各部件字号的缩放百分比上下限（100 = 参考样式实测值）
 
+# ---------------- 图库颜色标签（0.2.1）----------------
+# 七种预设低饱和度色：管理员只负责命名，颜色固定走这份表（前端取色也只认这七个）。
+TAG_COLORS = (
+    "#7FA0B8",  # 雾蓝
+    "#8FB59A",  # 灰绿
+    "#C98F8F",  # 豆沙
+    "#A79BC8",  # 灰紫
+    "#C9B27F",  # 沙金
+    "#B99B7F",  # 驼棕
+    "#7FB5AE",  # 青灰
+)
+TAG_NAME_MAX = 24  # 标签名上限（信任边界，防超长名字撑破卡片/表格）
+
 
 def _menu_size_pct(value) -> int:
     """字号百分比：非数字/越界一律收敛（显示旋钮，不是安全边界，收紧点没坏处）。"""
@@ -341,21 +367,115 @@ class GalleryPlus(Star):
             if msg == MENU_CMD:  # 菜单：裸发「图片帮助」也出图（下面 @filter.command 是带前缀那条路）
                 yield await self._menu_result(event)
                 return
-            names = {d.name for d in self._galleries.iterdir() if d.is_dir()}
-            if not names:
+            query, requested = self._parse_trigger(msg)
+            matches = self._match_trigger(query)
+            if not matches:
                 return
-            kw = msg if msg in names else (msg.split()[0] if msg.split() else "")
-            if kw not in names:
+            if len(matches) > 1:
+                yield await self._conflict_result(event, matches)
                 return
-            folder = self._galleries / kw
+            folder = self._galleries / matches[0]
             imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in EXTS]
             if not imgs:
-                logger.debug(f"关键词“{kw}”图库为空")
+                logger.debug(f"关键词“{matches[0]}”图库为空")
                 return
-            path = random.choice(imgs)
-            yield event.chain_result([await self._send_image(path)])
+            count = min(requested or self._send_count(), MAX_SEND_COUNT, len(imgs))
+            for result in await self._image_result(event, random.sample(imgs, count), query):
+                yield result
         except Exception as e:
             logger.error(f"图库plus 响应失败: {e}", exc_info=True)
+
+    def _runtime_settings(self) -> dict:
+        raw = self._settings.get("runtime")
+        raw = raw if isinstance(raw, dict) else {}
+        synonyms = raw.get("synonyms") if isinstance(raw.get("synonyms"), dict) else {}
+        clean = {k: list(v) for k, v in DEFAULT_SYNONYMS.items()}
+        for canonical, aliases in synonyms.items():
+            canonical = str(canonical).strip()
+            vals = aliases if isinstance(aliases, list) else str(aliases).split(",")
+            vals = [str(v).strip() for v in vals if str(v).strip()]
+            if canonical and vals:
+                clean[canonical] = list(dict.fromkeys(vals))
+        try:
+            count = min(max(int(raw.get("send_count", DEFAULT_SEND_COUNT)), 1), MAX_CONFIG_SEND_COUNT)
+        except (TypeError, ValueError):
+            count = DEFAULT_SEND_COUNT
+        try:
+            threshold = min(max(int(raw.get("forward_threshold", DEFAULT_FORWARD_THRESHOLD)), 2), MAX_SEND_COUNT)
+        except (TypeError, ValueError):
+            threshold = DEFAULT_FORWARD_THRESHOLD
+        return {"send_count": count, "forward_threshold": threshold, "synonyms": clean}
+
+    def _send_count(self) -> int:
+        return self._runtime_settings()["send_count"]
+
+    @staticmethod
+    def _replace_forms(text: str, synonyms: Mapping[str, List[str]]) -> set:
+        forms = {text}
+        for canonical, aliases in synonyms.items():
+            words = [canonical, *aliases]
+            for src in words:
+                for dst in words:
+                    if src != dst and src in text:
+                        forms.add(text.replace(src, dst))
+        return forms
+
+    def _gallery_trigger_forms(self, kw: str) -> set:
+        char = self._gallery_menu(kw)["char"].strip()
+        suffix = next((x for x in ("照片", "图片") if kw.endswith(x)), "")
+        if not suffix:
+            return {kw}
+        bases = {kw[:-len(suffix)], char, re.sub(r"[\s·・]+", "", char)}
+        tokens = [x for x in re.split(r"[\s·・]+", char) if x]
+        bases.update(tokens)
+        # 兼容“天童爱丽丝”→“爱丽丝照片”这类常用简称；只取至少两字的后缀，避免单字误触发。
+        for token in tokens:
+            bases.update(token[i:] for i in range(1, max(len(token) - 1, 1)))
+        return {kw, *(base + suffix for base in bases if len(base) >= 2)}
+
+    def _match_trigger(self, query: str) -> List[str]:
+        synonyms = self._runtime_settings()["synonyms"]
+        query_forms = self._replace_forms(query, synonyms)
+        out = []
+        for d in self._galleries.iterdir():
+            if not d.is_dir():
+                continue
+            forms = set()
+            for form in self._gallery_trigger_forms(d.name):
+                forms.update(self._replace_forms(form, synonyms))
+            if query_forms & forms:
+                out.append(d.name)
+        return sorted(out, key=pinyin_key)
+
+    @staticmethod
+    def _parse_trigger(msg: str):
+        parts = msg.split()
+        requested = None
+        if len(parts) > 1 and parts[-1].isdigit():
+            requested = min(max(int(parts.pop()), 1), MAX_SEND_COUNT)
+        return "".join(parts), requested
+
+    async def _image_result(self, event, paths: List[Path], label: str):
+        images = [await self._send_image(path) for path in paths]
+        if Nodes is not None and len(images) > self._runtime_settings()["forward_threshold"]:
+            try:
+                raw_uin = getattr(getattr(event, "message_obj", None), "self_id", 0)
+                try:
+                    uin = int(raw_uin)
+                except (TypeError, ValueError):
+                    uin = 0
+                # Nodes 才是单条合并转发容器；每个 Node 仍对应一条单图消息。
+                nodes = [Node(uin=uin, name=label or "图库plus", content=[image]) for image in images]
+                return [event.chain_result([Nodes(nodes)])]
+            except Exception as e:
+                logger.warning(f"合并转发不可用，改为逐张发送: {e}")
+        return [event.chain_result([image]) for image in images]
+
+    async def _conflict_result(self, event, matches: List[str]):
+        path = await asyncio.to_thread(self._render_menu, None, matches, True)
+        if path is None:
+            return event.plain_result("指令冲突：" + "、".join(matches))
+        return event.chain_result([Image.fromFileSystem(str(path))])
 
     # ---------------- 原插件指令回归（0.1.3）----------------
     # 指令走 AstrBot 命令系统，需要命令前缀（如 /收集）；关键词回图仍是裸消息触发，无需前缀。
@@ -592,12 +712,23 @@ class GalleryPlus(Star):
         return self._galleries / safe
 
     def _next_num(self, folder: Path, kw: str) -> int:
+        """下一个可用编号 = 图库内**图片文件**的最大编号 + 1。
+
+        只数插件认的图片文件：混进来的 kw-99.txt 之类杂物不该把新图顶成 100 号。
+        """
         nums = [
             int(m.group(1))
             for p in folder.iterdir()
-            if p.is_file() and (m := re.fullmatch(rf"{re.escape(kw)}-(\d+)", p.stem))
+            if p.is_file() and p.suffix.lower() in EXTS
+            and (m := re.fullmatch(rf"{re.escape(kw)}-(\d+)", p.stem))
         ]
         return max(nums) + 1 if nums else 1
+
+    @staticmethod
+    def _image_key(kw: str, name: str):
+        """图库内图片的排序/编号键：规范名按编号数值排（kw-10 在 kw-2 之后），乱名按名字排在最后。"""
+        m = re.fullmatch(rf"{re.escape(kw)}-(\d+)", Path(name).stem)
+        return (0, int(m.group(1)), name) if m else (1, 0, name)
 
     @staticmethod
     def _detect_ext(data: bytes) -> str:
@@ -644,6 +775,26 @@ class GalleryPlus(Star):
             self._pids[f"{kw}/{target.name}"] = pid
             self._save_pids()
         return target
+
+    def _rename_image(self, p: Path, t: Path, old_gal: str, keep_src_meta: bool = False) -> Path:
+        """改一张图的名字/位置：pid 与发送统计键跟着新文件名走（keep_src_meta=True 即复制：
+        文件用 copy2 保留源、源键不清），并清掉旧名的各档缩略图缓存。
+        old_gal 是 p 原本所属的图库名（pid/统计键的旧前缀）。"""
+        (shutil.copy2 if keep_src_meta else shutil.move)(str(p), str(t))
+        ok, nk = f"{old_gal}/{p.name}", f"{t.parent.name}/{t.name}"
+        pid = self._pids.get(ok)
+        if pid:
+            self._pids[nk] = pid
+        if not keep_src_meta:
+            self._pids.pop(ok, None)
+        row = self._stats.get("images", {}).get(ok)
+        if row:
+            self._stats.setdefault("images", {})[nk] = row
+            if not keep_src_meta:
+                self._stats.get("images", {}).pop(ok, None)
+        for th in (self._tmp / "thumbs").glob(f"{old_gal}_{p.stem}.*.thumb.jpg"):
+            th.unlink(missing_ok=True)
+        return t
 
     def import_files(self, pattern: str, files: List[dict]) -> dict:
         """批量导入：按搭积木式文件名格式解析，自动分库到对应关键词。
@@ -707,12 +858,10 @@ class GalleryPlus(Star):
         for key in [k for k in self._pids if k.startswith(f"{d.name}/")]:
             self._pids.pop(key, None)
         self._save_pids()
-        if isinstance(self._settings.get("gallery_wm"), dict):  # 库没了，水印开关一并清掉
-            self._settings["gallery_wm"].pop(d.name, None)
-            self._save_settings()
-        if isinstance(self._settings.get("gallery_menu"), dict):  # 菜单配置同理，别留脏键
-            self._settings["gallery_menu"].pop(d.name, None)
-            self._save_settings()
+        for key in ("gallery_wm", "gallery_menu", "gallery_tags"):  # 库没了：水印开关/菜单配置/标签引用一并清掉
+            if isinstance(self._settings.get(key), dict):
+                self._settings[key].pop(d.name, None)
+                self._save_settings()
         return True
 
     def list_galleries(self) -> List[dict]:
@@ -721,14 +870,16 @@ class GalleryPlus(Star):
             if not d.is_dir():
                 continue
             names = sorted(
-                p.name for p in d.iterdir()
-                if p.is_file() and p.suffix.lower() in EXTS
+                (p.name for p in d.iterdir()
+                 if p.is_file() and p.suffix.lower() in EXTS),
+                key=lambda n: self._image_key(d.name, n),  # 按编号数值排，kw-10 不排到 kw-2 前面
             )
             out.append(
                 {
                     "name": d.name,
                     "count": len(names),
                     "wm": self._gallery_wm(d.name),
+                    "tag": self._tag_of(d.name),
                     "cover": _stable_cover(d.name, d, names),
                     "images": [
                         {"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in names
@@ -748,11 +899,13 @@ class GalleryPlus(Star):
                 p.name for p in d.iterdir()
                 if p.is_file() and p.suffix.lower() in EXTS
             ]
+            files.sort(key=lambda n: self._image_key(name, n))
             out.append(
                 {
                     "name": name,
                     "count": len(files),
                     "wm": self._gallery_wm(name),
+                    "tag": self._tag_of(name),
                     "cover": _stable_cover(name, d, files),
                 }
             )
@@ -764,8 +917,9 @@ class GalleryPlus(Star):
         if not d or not d.is_dir():
             return [], 0
         names = sorted(
-            p.name for p in d.iterdir()
-            if p.is_file() and p.suffix.lower() in EXTS
+            (p.name for p in d.iterdir()
+             if p.is_file() and p.suffix.lower() in EXTS),
+            key=lambda n: self._image_key(d.name, n),  # 按编号数值排（kw-10 在 kw-2 之后）
         )
         page = names if limit is None else names[offset : offset + limit]
         return (
@@ -881,32 +1035,35 @@ class GalleryPlus(Star):
             runs.append((text[i:], False))
         return runs or [(text, False)]
 
-    @staticmethod
-    def _line_image(text: str, size: int, f_cjk, f_lat, color=WM_FG):
-        """把一行混排文字渲染成透明条带图（墨迹紧贴边缘，便于按墨迹顶部定位）。"""
+    def _seg_image(self, segs):
+        """多段文字共用基线渲染成透明条带图（每段自带字号/颜色，段内仍按 中/西文 选字体）。
+
+        segs = [(文字, 字号, 颜色), …]；墨迹紧贴边缘，便于按墨迹顶部定位。
+        """
         from PIL import Image, ImageDraw
 
-        fonts = []
-        for run, is_cjk in GalleryPlus._script_runs(text):
-            f = f_cjk if is_cjk else f_lat
-            if f not in fonts:
-                fonts.append(f)
-        asc = max(f.getmetrics()[0] for f in fonts)
-        desc = max(f.getmetrics()[1] for f in fonts)
-        img = Image.new("RGBA", (int(size * len(text) * 1.6) + 8, asc + desc + 8), (0, 0, 0, 0))
+        runs = []  # (片段, 字体, 颜色)
+        for text, size, color in segs:
+            f_cjk, f_lat = self._wm_fonts(size)
+            for run, is_cjk in self._script_runs(text):
+                runs.append((run, f_cjk if is_cjk else f_lat, color, size))
+        asc = max(f.getmetrics()[0] for _, f, _, _ in runs)
+        desc = max(f.getmetrics()[1] for _, f, _, _ in runs)
+        wid = sum(int(s * len(t) * 1.6) for t, s, _c in segs) + 8
+        img = Image.new("RGBA", (wid, asc + desc + 8), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         x = 4.0
-        for run, is_cjk in GalleryPlus._script_runs(text):
-            f = f_cjk if is_cjk else f_lat
+        for run, f, color, _s in runs:
             d.text((x, asc), run, font=f, fill=color + (255,), anchor="ls")
             x += d.textlength(run, font=f)
         bb = img.getbbox()
         return img.crop(bb) if bb else img
 
     def _render_watermark(self, path: Path) -> Path:
-        """发送时在图片下方拼信息条：主色方块 + 文件名/PID + pixiv 二维码。
+        """发送时在图片下方拼信息条：主色方块 + 角色名/灰色文件名 + PID + pixiv 二维码。
 
-        几何全部按条高占比换算（条高=图高×8%），任何尺寸视觉一致；动图跳过。
+        几何全部按条高占比换算（条高=图高×8.8%，0.2.1 起为原先的 110%），任何尺寸视觉一致；
+        原图太窄放不下信息条内容时等比放大到最低宽度（只放大不缩小）；动图跳过。
         """
         if path.suffix.lower() == ".gif":
             return path
@@ -916,9 +1073,31 @@ class GalleryPlus(Star):
             return path
         try:
             pid = self._pids.get(f"{path.parent.name}/{path.name}")
+            char = self._gallery_menu(path.parent.name)["char"]  # 角色名，缺省=关键词
             im = Image.open(path).convert("RGB")
+
+            def lines(b):
+                """按条高 b 渲染两行文字：行1=角色名+灰色文件名（共用基线），行2=PID。"""
+                tail = round(b * WM_QR_SIZE) + round(b * WM_QR_RIGHT) + round(b * WM_TEXT_GAP) if pid else round(b * 0.3)
+                max_w = im.width - round(b * WM_TEXT_X) - tail
+                line1 = self._fit_line([
+                    (char, round(b * WM_TEXT1_SIZE), WM_FG),
+                    ("_" + path.name, round(b * WM_GRAY_SIZE), WM_GRAY),
+                ], max_w)
+                line2 = self._fit_line(
+                    [(f"PID {pid}" if pid else "暂无 PID信息", round(b * WM_TEXT2_SIZE), WM_FG)], max_w)
+                return tail, line1, line2
+
             w, h = im.size
             b = max(round(h * WM_BAR_FRAC), 1)
+            tail, line1, line2 = lines(b)
+            # 最低宽度 = 文字左边距 + 两行中较宽者 + 右侧占用；窄于它必重叠 → 等比放大（只放大不缩小）
+            need = round(b * WM_TEXT_X) + max(line1.width, line2.width) + tail
+            if w < need:
+                im = im.resize((need, max(round(h * need / w), 1)), Image.LANCZOS)
+                b = max(round(im.height * WM_BAR_FRAC), 1)
+                tail, line1, line2 = lines(b)
+            w, h = im.size
             canvas = Image.new("RGB", (w, h + b), WM_BG)
             canvas.paste(im, (0, 0))
             d = ImageDraw.Draw(canvas)
@@ -930,13 +1109,6 @@ class GalleryPlus(Star):
                  round(b * WM_SQUARE_X) + sq - 1, top + (b - sq) // 2 + sq - 1),
                 fill=self._theme_color(im),
             )
-            # 两行文字（中/西文字体可分设；行宽超出可用空间时逐级缩字号）
-            qr_px = round(b * WM_QR_SIZE)
-            qr_right = round(b * WM_QR_RIGHT)
-            max_text_w = w - round(b * WM_TEXT_X) - (qr_px + qr_right + round(b * 0.2) if pid else round(b * 0.3))
-            line1 = self._fit_line(path.name, round(b * WM_TEXT1_SIZE), max_text_w)
-            line2_text = f"PID {pid}" if pid else "暂无 PID信息"
-            line2 = self._fit_line(line2_text, round(b * WM_TEXT2_SIZE), max_text_w)
             # 两行作为一整块垂直居中（gap 是两行墨迹顶部的距离，块高 = gap + 第二行高）
             gap = round(b * WM_TEXT_LINE_GAP)
             t_top = (b - (gap + line2.height)) // 2
@@ -944,11 +1116,11 @@ class GalleryPlus(Star):
             canvas.paste(line2, (round(b * WM_TEXT_X), top + t_top + gap), line2)
             # 二维码（有 pid 才画，垂直居中）
             if pid:
-                qr = self._qr_image(pid, qr_px)
+                qr = self._qr_image(pid, round(b * WM_QR_SIZE))
                 if qr is not None:
                     canvas.paste(
                         qr,
-                        (w - qr_px - qr_right, top + (b - qr_px) // 2),
+                        (w - round(b * WM_QR_SIZE) - round(b * WM_QR_RIGHT), top + (b - round(b * WM_QR_SIZE)) // 2),
                     )
             fmt = "png" if str(self.config.get("output_format", "jpg")).lower() == "png" else "jpg"
             out = self._tmp / f"{path.parent.name}_{path.stem}.wm.{fmt}"
@@ -961,14 +1133,12 @@ class GalleryPlus(Star):
             logger.warning(f"水印生成失败，发送原图: {e}")
             return path
 
-    def _fit_line(self, text: str, size: int, max_w: int):
-        """渲染一行文字；超宽时缩小字号重渲（最长以可用宽度为限）。"""
-        f_cjk, f_lat = self._wm_fonts(size)
-        img = self._line_image(text, size, f_cjk, f_lat)
-        while img.width > max_w and size > 8:
-            size -= 2
-            f_cjk, f_lat = self._wm_fonts(size)
-            img = self._line_image(text, size, f_cjk, f_lat)
+    def _fit_line(self, segs, max_w: int):
+        """渲染一行多段文字；超宽时整体缩小字号重渲（最长以可用宽度为限）。"""
+        img = self._seg_image(segs)
+        while img.width > max_w and segs[0][1] > 8:
+            segs = [(t, s - 2, c) for t, s, c in segs]
+            img = self._seg_image(segs)
         return img
 
     # ---------------- 图库菜单（0.2.0）----------------
@@ -1008,6 +1178,34 @@ class GalleryPlus(Star):
         self._save_settings()
         return self._gallery_menu(kw)
 
+    # ---------------- 图库颜色标签（0.2.1）----------------
+
+    def _tag_table(self) -> Dict[str, Dict[str, str]]:
+        """settings.json 里的 tags 表：{标签id: {name, color}}（不是 dict 就地修正）。"""
+        t = self._settings.get("tags")
+        if not isinstance(t, dict):
+            t = {}
+            self._settings["tags"] = t
+        return t
+
+    def _gallery_tags(self) -> Dict[str, str]:
+        """图库 → 标签 id 的映射表（同上就地修正）。"""
+        m = self._settings.get("gallery_tags")
+        if not isinstance(m, dict):
+            m = {}
+            self._settings["gallery_tags"] = m
+        return m
+
+    def _tag_of(self, kw: str) -> Optional[Dict[str, str]]:
+        """图库当前的标签（无标签 / 标签已被删 → None）。"""
+        tid = self._gallery_tags().get(kw)
+        row = self._tag_table().get(tid)
+        if not isinstance(row, dict) or not str(row.get("name") or "").strip():
+            return None
+        color = str(row.get("color") or "")
+        return {"id": tid, "name": str(row["name"]),
+                "color": color if color in TAG_COLORS else TAG_COLORS[0]}
+
     def _menu_config(self) -> Dict[str, Any]:
         """菜单文字 + 各部件字体（中/英/日三槽）/字号（缺项回落默认值）。"""
         m = self._settings.get("menu")
@@ -1045,14 +1243,15 @@ class GalleryPlus(Star):
         self._save_settings()
         return target.name
 
-    def _menu_data(self) -> Dict[str, List[tuple]]:
+    def _menu_data(self, only: Optional[List[str]] = None) -> Dict[str, List[tuple]]:
         """按分区列出进菜单的 (角色名, 关键词)，分区内按拼音排序。"""
+        allowed = set(only) if only is not None else None
         out: Dict[str, List[tuple]] = {g: [] for g in MENU_GROUP_NAMES}
         for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
-            if not d.is_dir():
+            if not d.is_dir() or (allowed is not None and d.name not in allowed):
                 continue
             m = self._gallery_menu(d.name)
-            if m["show"]:
+            if m["show"] or allowed is not None:
                 out.setdefault(m["group"], []).append((m["char"], d.name))
         for rows in out.values():
             rows.sort(key=lambda ck: (pinyin_key(ck[0]), pinyin_key(ck[1])))
@@ -1094,7 +1293,7 @@ class GalleryPlus(Star):
         cols.append(cur)
         return [c for c in cols if c]
 
-    def _render_menu(self, width: Optional[int] = None) -> Optional[Path]:
+    def _render_menu(self, width: Optional[int] = None, only: Optional[List[str]] = None, conflict: bool = False) -> Optional[Path]:
         """渲染图库菜单图：版式按参考样图复刻，全部尺寸随宽度等比缩放。返回文件路径。"""
         try:
             from PIL import Image, ImageDraw
@@ -1124,8 +1323,10 @@ class GalleryPlus(Star):
                 return _menu_line(text, f(part, P(size)), color)
 
             # ---- 内容 ----
-            data = self._menu_data()
-            total, newest = self._menu_stats()
+            data = self._menu_data(only)
+            total, newest = self._menu_stats() if only is None else (sum(len(v) for v in data.values()), 0)
+            if conflict:
+                cfg["title"] = "指令冲突"
             import datetime as _dt
 
             up = _dt.datetime.fromtimestamp(newest) if newest else _dt.datetime.now()
@@ -1493,6 +1694,31 @@ class GalleryPlus(Star):
             async with self._save_lock:
                 return json_response(self.import_files(pattern, payload.get("files", [])))
 
+        if action == "get_runtime_settings":
+            return json_response(self._runtime_settings())
+
+        if action == "save_runtime_settings":
+            try:
+                send_count = min(max(int(payload.get("send_count", DEFAULT_SEND_COUNT)), 1), MAX_CONFIG_SEND_COUNT)
+                forward_threshold = min(max(int(payload.get("forward_threshold", DEFAULT_FORWARD_THRESHOLD)), 2), MAX_SEND_COUNT)
+            except (TypeError, ValueError):
+                return error_response("发送数量或合并转发阈值必须是数字", status_code=400)
+            synonyms = payload.get("synonyms", {})
+            if not isinstance(synonyms, dict):
+                return error_response("同义词必须是对象", status_code=400)
+            clean = {}
+            for canonical, aliases in synonyms.items():
+                canonical = str(canonical).strip()
+                if not canonical:
+                    continue
+                vals = aliases if isinstance(aliases, list) else str(aliases).split(",")
+                vals = list(dict.fromkeys(str(v).strip() for v in vals if str(v).strip() and str(v).strip() != canonical))
+                if vals:
+                    clean[canonical] = vals
+            self._settings["runtime"] = {"send_count": send_count, "forward_threshold": forward_threshold, "synonyms": clean}
+            self._save_settings()
+            return json_response({"ok": True, **self._runtime_settings()})
+
         if action == "get_settings":  # 水印设置：当前字体 + 可用字体列表（系统 + 上传池）
             return json_response(
                 {
@@ -1507,7 +1733,9 @@ class GalleryPlus(Star):
         if action == "save_settings":  # 保存水印字体设置（名称必须是可用的字体文件）；顺带存每行张数偏好
             idx = _font_index(str(self._fonts_dir))
             for key, default in (("cjk", DEFAULT_CJK_FONT), ("latin", DEFAULT_LATIN_FONT)):
-                name = str(payload.get(key, "")).strip()
+                if key not in payload:  # 未提供的键不动：每行张数偏好也走这个 action，别把字体冲回默认
+                    continue
+                name = str(payload[key]).strip()
                 if name and name.lower() not in idx:
                     return error_response(f"系统中未找到字体文件: {name}", status_code=400)
                 self._settings[f"wm_font_{key}"] = name or default
@@ -1706,6 +1934,117 @@ class GalleryPlus(Star):
                 }
             )
 
+        if action == "list_tags":  # 标签管理弹窗与各处打标下拉的数据源
+            return json_response({"tags": self._tag_table(), "colors": TAG_COLORS})
+
+        if action == "save_tag":  # 新建/修改标签：颜色只认预设七色；名称不许重名（按名选择才有唯一解）
+            table = self._tag_table()
+            tid = str(payload.get("id") or "")
+            name = str(payload.get("name") or "").strip()[:TAG_NAME_MAX]
+            color = str(payload.get("color") or "") or TAG_COLORS[0]
+            if not name:
+                return error_response("标签名称不能为空")
+            if color not in TAG_COLORS:
+                return error_response("颜色必须是预设色之一")
+            if tid and tid not in table:
+                return error_response("标签不存在", status_code=404)
+            if any(isinstance(r, dict) and r.get("name") == name and i != tid for i, r in table.items()):
+                return error_response("已有同名标签")
+            if not tid:
+                tid = uuid.uuid4().hex[:8]
+            table[tid] = {"name": name, "color": color}
+            self._save_settings()
+            return json_response({"ok": True, "id": tid, "tags": table})
+
+        if action == "delete_tag":  # 删标签连带摘掉各图库的引用，不留脏键
+            table = self._tag_table()
+            tid = str(payload.get("id") or "")
+            if tid not in table:
+                return error_response("标签不存在", status_code=404)
+            table.pop(tid, None)
+            gmap = self._gallery_tags()
+            for k in [k for k, v in gmap.items() if v == tid]:
+                gmap.pop(k, None)
+            self._save_settings()
+            return json_response({"ok": True, "tags": table})
+
+        if action == "set_gallery_tag":  # 图库打标/清标（tag 为空串即清除）
+            d = self._kw_dir(str(payload.get("name", "")))
+            if not d or not d.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            tid = str(payload.get("tag") or "")
+            if tid and tid not in self._tag_table():
+                return error_response("标签不存在", status_code=404)
+            if tid:
+                self._gallery_tags()[d.name] = tid
+            else:
+                self._gallery_tags().pop(d.name, None)
+            self._save_settings()
+            return json_response({"ok": True, "tag": self._tag_of(d.name)})
+
+        if action == "rename":  # 图库改名（触发词）：文件夹、内部图片、pid/统计/水印/菜单/标签键一起搬
+            async with self._save_lock:
+                d = self._kw_dir(str(payload.get("name", "")))
+                new_raw = str(payload.get("new_name", ""))
+                new = self._safe_kw(new_raw)
+                if not d or not d.is_dir():
+                    return error_response("图库不存在或非法", status_code=404)
+                if not new_raw.strip():
+                    return error_response("新关键词不能为空")
+                if new != new_raw:  # 与 _kw_dir 同标准：不改写不猜测，含非法字符就拒
+                    return error_response("新关键词含非法字符", status_code=400)
+                if new != d.name:
+                    if (self._galleries / new).exists():
+                        return error_response("已有同名图库", status_code=400)
+                    newd = self._galleries / new
+                    d.rename(newd)
+                    num_re = re.compile(rf"^{re.escape(d.name)}-(\d+)(\.[A-Za-z0-9]+)$")
+                    for p in sorted(newd.iterdir()):
+                        m = num_re.fullmatch(p.name) if p.is_file() else None
+                        if m:  # 只改符合 关键词-编号.扩展名 的；不合规的留给「文件名同步」
+                            self._rename_image(p, newd / f"{new}-{m.group(1)}{m.group(2)}", d.name)
+                    for key in ("gallery_wm", "gallery_menu", "gallery_tags"):
+                        tbl = self._settings.get(key)
+                        if isinstance(tbl, dict) and d.name in tbl:
+                            tbl[new] = tbl.pop(d.name)
+                    self._save_settings()
+                    self._save_pids()
+                    try:
+                        self._save_stats()
+                    except OSError:
+                        pass
+                    for t in (self._tmp / "thumbs").glob(f"{d.name}_*.thumb.jpg"):
+                        t.unlink(missing_ok=True)
+                return json_response({"ok": True, "name": new})
+
+        if action == "sync_names":  # 文件名同步：全部图片按现有编号顺序重排成连续 1..N，pid/统计跟文件走
+            async with self._save_lock:
+                changed = 0
+                for d in self._galleries.iterdir():
+                    if not d.is_dir():
+                        continue
+                    imgs = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS]
+                    imgs.sort(key=lambda p: self._image_key(d.name, p.name))  # 规范名按编号，乱名排最后
+                    # 先全部挪到临时名，再落最终名：否则同编号不同后缀（kw-1.png / kw-1.jpg / kw-2.png）
+                    # 重排时会互相覆盖，pid 跟着错配
+                    moves = []
+                    for i, p in enumerate(imgs, 1):
+                        t = d / f"{d.name}-{i}{p.suffix}"
+                        if p.name == t.name:
+                            continue
+                        tp = d / f".sync-{i}{p.suffix}"
+                        self._rename_image(p, tp, d.name)
+                        moves.append((tp, t))
+                    for tp, t in moves:
+                        self._rename_image(tp, t, d.name)
+                        changed += 1
+                self._save_pids()
+                try:
+                    self._save_stats()
+                except OSError:
+                    pass
+                return json_response({"ok": True, "changed": changed})
+
         if action == "batch":  # 选择模式批量操作：删除 / 移动 / 复制（dst 仅 move/copy 需要）
             src = self._kw_dir(str(payload.get("src", "")))
             op = str(payload.get("op", ""))
@@ -1727,25 +2066,15 @@ class GalleryPlus(Star):
                     if op == "delete":
                         self.delete_image(src.name, image)
                     elif op in ("move", "copy"):
-                        if (dst / image).exists():  # 同名不覆盖：跳过并上报
-                            failed.append(image)
-                            continue
-                        (shutil.move if op == "move" else shutil.copy2)(p, dst / image)
-                        pid = self._pids.get(f"{src.name}/{image}")
-                        if pid:
-                            self._pids[f"{dst.name}/{image}"] = pid
-                            if op == "move":
-                                self._pids.pop(f"{src.name}/{image}", None)
-                        if op == "move":  # 发送统计跟着文件走（复制是新文件、重新计数）
-                            row = self._stats.get("images", {}).pop(f"{src.name}/{image}", None)
-                            if row:
-                                self._stats.setdefault("images", {})[f"{dst.name}/{image}"] = row
+                        # 跨库一律改名成 目标库-编号.扩展名（编号接着目标库现有最大号排）；
+                        # pid 与发送统计跟着新文件名走，复制时源文件与源 pid 保留
+                        t = dst / f"{dst.name}-{self._next_num(dst, dst.name)}{p.suffix}"
+                        self._rename_image(p, t, src.name, keep_src_meta=op == "copy")
                     done += 1
                 except OSError:
                     failed.append(image)
             if op in ("move", "copy"):
                 self._save_pids()
-            if op == "move":
                 try:
                     self._save_stats()
                 except OSError:
@@ -1764,6 +2093,7 @@ class GalleryPlus(Star):
                         "name": d.name,
                         "count": n,
                         "wm": self._gallery_wm(d.name),
+                        "tag": self._tag_of(d.name),
                         "menu": self._gallery_menu(d.name),
                     }
                 )

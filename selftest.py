@@ -54,8 +54,12 @@ def _passthrough(*a, **k):
 for n in ("event_message_type", "command", "permission_type"):
     setattr(filter_ns, n, _passthrough)
 
+_Node = type("Node", (), {"__init__": lambda self, **kw: self.__dict__.update(kw)})
+_Nodes = type("Nodes", (), {"__init__": lambda self, nodes: setattr(self, "nodes", nodes)})
 _mod("astrbot.api.message_components",
      Image=type("Image", (), {"fromFileSystem": staticmethod(lambda p: p)}),
+     Node=_Node,
+     Nodes=_Nodes,
      Reply=type("Reply", (), {}))
 _mod("astrbot.api.star",
      Context=object,
@@ -186,6 +190,9 @@ assert g.delete_gallery("可琳照片")
 assert not (g._galleries / "可琳照片").exists() and g._pids == {}
 assert not g.delete_gallery("可琳照片")
 
+# 5b) 兼容指令 / 同义词 / 数量解析（0.2.1）
+# 放在 Pages 的基础列表断言之后，避免新增测试图库污染旧断言。
+
 # 6) Pages action 协议（假 request 覆盖 main.request，走 api_galleries 全流程）
 import asyncio, base64  # noqa: E402
 
@@ -229,6 +236,46 @@ res = _act("POST", {"action": "list_images", "name": "测试库", "offset": 0, "
 assert res["total"] == 1 and res["images"][0]["file"] == "测试库-1.jpg", res
 res = _act("POST", {"action": "list_images", "name": "a/../b", "offset": 0, "limit": 50})
 assert res["status"] == "error", res
+
+# 5b 实际断言：兼容指令 / 同义词 / 数量解析
+_gmenu = {
+    "可琳照片": {"show": True, "char": "可琳·威克斯", "group": "个人"},
+    "博丽灵梦照片": {"show": True, "char": "博丽 灵梦", "group": "个人"},
+}
+g._settings["gallery_menu"] = _gmenu
+g.save_upload("可琳照片", "a.jpg", b"a")
+g.save_upload("博丽灵梦照片", "b.jpg", b"b")
+assert g._match_trigger("可琳照片") == ["可琳照片"]
+assert g._match_trigger("威克斯照片") == ["可琳照片"]
+assert g._match_trigger("博丽照片") == ["博丽灵梦照片"]
+assert g._match_trigger("灵梦照片") == ["博丽灵梦照片"]
+assert g._parse_trigger("可琳照片 5") == ("可琳照片", 5)
+g._settings["runtime"] = {"send_count": 4, "forward_threshold": 4, "synonyms": {"照片": ["图片"]}}
+assert g._match_trigger("可琳图片") == ["可琳照片"]
+assert g._send_count() == 4
+
+# 5c) 合并转发：一条外层转发链包含 N 个 Node，每个 Node 只有一张图片
+class _Event:
+    message_obj = types.SimpleNamespace(self_id="10001")
+    def chain_result(self, chain):
+        return chain
+old_send = g._send_image
+async def _fake_send(path):
+    return f"img:{path.name}"
+g._settings["runtime"]["forward_threshold"] = 3
+g._send_image = _fake_send
+plain = asyncio.run(g._image_result(_Event(), [Path("1"), Path("2"), Path("3")], "可琳照片"))
+assert plain == [["img:1"], ["img:2"], ["img:3"]], plain
+forward = asyncio.run(g._image_result(_Event(), [Path("1"), Path("2"), Path("3"), Path("4")], "可琳照片"))
+assert len(forward) == 1 and len(forward[0]) == 1, forward
+assert len(forward[0][0].nodes) == 4 and all(len(node.content) == 1 for node in forward[0][0].nodes), forward
+assert all(node.uin == 10001 for node in forward[0][0].nodes), forward
+g._send_image = old_send
+
+assert g.delete_gallery("可琳照片") and g.delete_gallery("博丽灵梦照片")
+g._settings.pop("gallery_menu", None)
+g._settings.pop("runtime", None)
+
 # thumb（有 PIL 时：真图 → 缩略图 + 磁盘缓存；size 可选（封面要高清）；坏图 → 404）
 try:
     from PIL import Image as _P  # noqa: F401
@@ -362,6 +409,10 @@ assert (g._galleries / kw).is_dir() and (g._galleries / kw / res["imported"][0][
 try:
     from PIL import Image as PImage
 
+    # 着重号·随汉字走中文字体（西文字体普遍缺这个字形），"可琳·威克斯"应切不出西文段
+    assert main.GalleryPlus._script_runs("可琳·威克斯") == [("可琳·威克斯", True)], \
+        main.GalleryPlus._script_runs("可琳·威克斯")
+
     def _mkimg(w, h, color="red"):
         buf = io.BytesIO()
         PImage.new("RGB", (w, h), color).save(buf, "PNG")
@@ -375,12 +426,18 @@ try:
     assert out.suffix == ".jpg", out  # 默认输出 jpg（体积更小）
     im = PImage.open(out).convert("RGB")
     w, h = im.size
-    assert (w, h) == (400, 540), (w, h)          # 条高 = 500*0.08 = 40
+    assert (w, h) == (400, 544), (w, h)          # 条高 = 500*0.088 = 44（0.08 的 110%）
     b = h - 500
     assert abs(b / 500 - main.WM_BAR_FRAC) < 0.01, b
     near = lambda c, want, t=8: all(abs(c[i] - want[i]) <= t for i in range(3))  # jpg 有损
     assert near(im.getpixel((w // 2, h - 2)), main.WM_BG), "条底色不符"
     assert near(im.getpixel((w // 2, 10)), (255, 0, 0)), "原图区域被改动"  # 红图未变
+    # 第一行 = 角色名（黑）+ 灰色文件名：文字区应有近黑墨迹（角色名）也有中间调墨迹（灰字）
+    tx0 = round(b * main.WM_TEXT_X)
+    tz = im.crop((tx0, h - b, w - round(b * (main.WM_QR_SIZE + main.WM_QR_RIGHT)) - 4, h))
+    lv = list(tz.convert("L").getdata())
+    assert min(lv) < 100, "第一行缺少角色名墨迹"
+    assert sum(1 for v in lv if 120 < v < 215) > 0, "第一行缺少灰色文件名墨迹"
     # 条内内容整体垂直居中（二维码是最高的元素，其中心即条中心）
     bar = im.crop((0, h - b, w, h)).convert("RGB")
     bg = main.WM_BG
@@ -404,6 +461,15 @@ try:
     qr_zone2 = im2.crop((w2 - round(b2 * main.WM_QR_SIZE) - round(b2 * main.WM_QR_RIGHT) - 2,
                          h2 - b2, w2, h2 - b2 + round(b2 * 0.75)))
     assert min(qr_zone2.convert("L").getdata()) > 200, "无 pid 不应出现二维码"
+    # 最低宽度：太窄的图等比放大到信息条放得下（只放大不缩小），宽图保持原尺寸
+    nsrc = _tmp / "narrow.png"
+    nsrc.write_bytes(_mkimg(120, 400))
+    nim = PImage.open(g._render_watermark(nsrc)).convert("RGB")
+    assert nim.width > 120, nim.size                      # 放大了
+    exp_h = round(400 * nim.width / 120)                  # 等比放大后的原图高度
+    assert abs((nim.height - exp_h) / exp_h - main.WM_BAR_FRAC) < 0.01, nim.size  # 条高仍按 0.088
+    wide = PImage.open(g._render_watermark(src)).size
+    assert wide == (400, 544), wide                       # 够宽的图不缩放
     # 主题色：纯红图 → 压暗后的红色调
     tc = main.GalleryPlus._theme_color(PImage.new("RGB", (60, 60), (255, 0, 0)))
     assert isinstance(tc, tuple) and len(tc) == 3 and tc[0] > tc[1] and tc[0] > tc[2], tc
@@ -447,6 +513,16 @@ assert res["ok"], res
 res = _act("POST", {"action": "save_settings", "cjk": "不存在的字体.ttf"})
 assert res["status"] == "error", res
 assert json.loads((_tmp / "settings.json").read_text(encoding="utf-8"))["wm_font_cjk"] == "simhei.ttf"
+# 只传 cols（每行张数按钮）不得把字体冲回默认（0.2.1 修的持久化 bug：缺省键曾把字体重置）
+_act("POST", {"action": "save_settings", "cols": 5})
+assert json.loads((_tmp / "settings.json").read_text(encoding="utf-8"))["wm_font_cjk"] == "simhei.ttf"
+_act("POST", {"action": "save_settings", "cols": 7})  # 还原每行张数缺省，别影响后面的用例
+# 运行设置：默认值、同义词与边界收敛
+res = _act("POST", {"action": "get_runtime_settings"})
+assert res["send_count"] == 1 and res["forward_threshold"] == 3 and "照片" in res["synonyms"], res
+res = _act("POST", {"action": "save_runtime_settings", "send_count": 5, "forward_threshold": 5, "synonyms": {"照片": ["图片", "相片"]}})
+assert res["ok"] and res["send_count"] == 5 and res["forward_threshold"] == 5, res
+assert g._runtime_settings()["synonyms"]["照片"] == ["图片", "相片"]
 
 # 9b) 上传字体：扩展名/内容校验（信任边界），有效字体进字体池并可被选中
 res = _act("POST", {"action": "upload_font", "name": "../evil.ttf", "data": base64.b64encode(b"x").decode()})
@@ -745,7 +821,8 @@ _rows = {r["name"]: r for r in res["galleries"]}
 assert _rows["菜单库"]["menu"] == {"show": False, "char": "菜单库", "group": "个人"}, _rows.get("菜单库")
 assert _rows["菜单库"]["wm"] is True, _rows.get("菜单库")           # 没动过的库缺省开水印
 assert _rows["可琳照片"]["count"] > 0, _rows.get("可琳照片")  # 前序用例导入过 2 张
-assert set(_rows["菜单库"]) == {"name", "count", "wm", "menu"}, _rows["菜单库"]
+assert set(_rows["菜单库"]) == {"name", "count", "wm", "tag", "menu"}, _rows["菜单库"]
+assert _rows["菜单库"]["tag"] is None  # 没打过标签
 
 # 12e) 封面稳定随机：目录内容不变 → 两次列表同一张；内容变化 → 种子换、封面仍是库内文件
 res1 = _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})
@@ -767,20 +844,22 @@ def _up(gal, fn):
                          "files": [{"name": fn, "data": base64.b64encode(b"i").decode()}]})["saved"][0]["file"]
 
 
-a1 = _up("批量A", "95026140_p1.jpg")  # pid 命名 → 记 pid
-a2 = _up("批量A", "2_a.jpg")
-_up("批量B", "1_b.jpg")
+a1 = _up("批量A", "95026140_p1.jpg")  # pid 命名 → 记 pid；入库为 批量A-1.jpg
+a2 = _up("批量A", "2_a.jpg")          # → 批量A-2.jpg，无 pid
+_up("批量B", "1_b.jpg")               # → 批量B-1.jpg
+# 跨库移动/复制：文件一律改名为 目标库-编号.扩展名，pid 与统计跟新文件名走（复制保留源）
 res = _act("POST", {"action": "batch", "op": "copy", "src": "批量A", "dst": "批量B", "images": [a1]})
-assert res["done"] == 1 and res["failed"] == [] and (g._galleries / "批量B" / a1).is_file(), res
-assert g._pids.get(f"批量B/{a1}") == "95026140_p1", res          # pid 跟着走，源保留
+assert res["done"] == 1 and res["failed"] == [] and (g._galleries / "批量B" / "批量B-2.jpg").is_file(), res
+assert g._pids.get("批量B/批量B-2.jpg") == "95026140_p1", res          # pid 跟新文件名
+assert g._pids.get("批量A/批量A-1.jpg") == "95026140_p1", res          # 复制：源保留
 res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B",
                     "images": [a2, "不在.jpg", "../x.jpg"]})
 assert res["done"] == 1 and res["failed"] == ["不在.jpg", "../x.jpg"], res
-assert not (g._galleries / "批量A" / a2).exists() and (g._galleries / "批量B" / a2).is_file(), res
+assert not (g._galleries / "批量A" / a2).exists() and (g._galleries / "批量B" / "批量B-3.jpg").is_file(), res
 res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B", "images": [a1]})
-assert res["done"] == 0 and res["failed"] == [a1], res           # 目标已有同名：跳过不覆盖
-res = _act("POST", {"action": "batch", "op": "delete", "src": "批量B", "images": [a1]})
-assert res["done"] == 1 and not (g._galleries / "批量B" / a1).exists(), res
+assert res["done"] == 1 and res["failed"] == [], res                   # 同名冲突已不存在：一律改名入目标库
+assert (g._galleries / "批量B" / "批量B-4.jpg").is_file()
+assert g._pids.get("批量B/批量B-4.jpg") == "95026140_p1" and "批量A/批量A-1.jpg" not in g._pids
 for _bad in ({"op": "??", "src": "批量A"}, {"op": "move", "src": "批量A", "dst": "没有的库"},
              {"op": "copy", "src": "../etc"}):
     res = _act("POST", {"action": "batch", **_bad, "images": []})
@@ -797,23 +876,26 @@ assert _act("POST", {"action": "list_images", "name": "批量A", "offset": 0, "l
 
 # 12g) 静默发送计数（图片/图库 + 时段）+ 悬停信息接口 + 移动迁统计
 g.config["watermark"] = False
-p_a1 = g._galleries / "批量A" / a1
+p_a1 = g._galleries / "批量B" / "批量B-4.jpg"
 asyncio.run(g._send_image(p_a1))
 asyncio.run(g._send_image(p_a1))
-_row = g._stats["images"][f"批量A/{a1}"]
+_row = g._stats["images"]["批量B/批量B-4.jpg"]
 assert _row["sends"] == 2 and len(_row["hours"]) == 24 and sum(_row["hours"]) == 2, _row
-assert g._stats["galleries"]["批量A"]["sends"] == 2, g._stats["galleries"]
-assert json.loads((g._root / "stats.json").read_text("utf-8"))["images"][f"批量A/{a1}"]["sends"] == 2
-res = _act("POST", {"action": "image_info", "name": "批量A", "image": a1})
+assert g._stats["galleries"]["批量B"]["sends"] == 2, g._stats["galleries"]
+assert json.loads((g._root / "stats.json").read_text("utf-8"))["images"]["批量B/批量B-4.jpg"]["sends"] == 2
+res = _act("POST", {"action": "image_info", "name": "批量B", "image": "批量B-4.jpg"})
 assert res["sends"] == 2 and res["size"] == p_a1.stat().st_size, res
-assert res["gallery"] == "批量A" and res["file"] == a1, res
+assert res["gallery"] == "批量B" and res["file"] == "批量B-4.jpg", res
 assert res["uid"] == "95026140" and res["pid"] == "95026140_p1", res
 assert res["path"] == str(p_a1), res                                       # 绝对路径
 assert res["color"] is None or (res["color"].startswith("#") and len(res["color"]) == 7), res
-assert _act("POST", {"action": "image_info", "name": "批量A", "image": "../x.jpg"})["status"] == "error"
-res = _act("POST", {"action": "batch", "op": "move", "src": "批量A", "dst": "批量B", "images": [a1]})
-assert res["done"] == 1 and g._stats["images"][f"批量B/{a1}"]["sends"] == 2, res  # 统计键随迁
-assert f"批量A/{a1}" not in g._stats["images"], g._stats["images"]
+assert _act("POST", {"action": "image_info", "name": "批量B", "image": "../x.jpg"})["status"] == "error"
+# 再移动一次：统计键随文件一起搬到新库新名
+_act("POST", {"action": "create", "name": "批量C"})
+res = _act("POST", {"action": "batch", "op": "move", "src": "批量B", "dst": "批量C", "images": ["批量B-4.jpg"]})
+assert res["done"] == 1, res
+assert g._stats["images"]["批量C/批量C-1.jpg"]["sends"] == 2, g._stats["images"]
+assert "批量B/批量B-4.jpg" not in g._stats["images"], g._stats["images"]
 g.config["watermark"] = True
 
 # 12h) 悬停预览的带水印真实效果图：开=有信息条（高>宽），关=原样；防穿越
@@ -841,7 +923,120 @@ except ImportError:
     print("(无 PIL，跳过带水印预览检查)")
 g.config["watermark"] = True
 
-assert g.delete_gallery("批量A") and g.delete_gallery("批量B")
+# 12i) 颜色标签：建/改/删 + 打标/清标 + 列表带回 + 删库连带清理（0.2.1）
+res = _act("POST", {"action": "list_tags"})
+assert res["colors"] == main.TAG_COLORS and res["tags"] == {}, res
+res = _act("POST", {"action": "save_tag", "name": "重点", "color": ""})  # 缺省色
+_tid = res["id"]
+assert _tid and res["tags"][_tid] == {"name": "重点", "color": main.TAG_COLORS[0]}, res
+# 重名拒绝 / 非预设色拒绝 / 空名拒绝 / 改不存在的 id 404
+assert _act("POST", {"action": "save_tag", "name": "重点", "color": main.TAG_COLORS[1]})["status"] == "error"
+assert _act("POST", {"action": "save_tag", "name": "x", "color": "#123456"})["status"] == "error"
+assert _act("POST", {"action": "save_tag", "name": "  ", "color": main.TAG_COLORS[1]})["status"] == "error"
+assert _act("POST", {"action": "save_tag", "id": "没有的", "name": "x", "color": main.TAG_COLORS[1]})["status"] == "error"
+# 改名换色
+res = _act("POST", {"action": "save_tag", "id": _tid, "name": "次要", "color": main.TAG_COLORS[2]})
+assert res["tags"][_tid] == {"name": "次要", "color": main.TAG_COLORS[2]}, res
+# 打标 → 列表带回；打不存在的标签 / 给不存在的库打标 → error；清标 → None
+assert _act("POST", {"action": "set_gallery_tag", "name": "批量A", "tag": _tid})["ok"]
+row = next(x for x in _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})["galleries"]
+           if x["name"] == "批量A")
+assert row["tag"] == {"id": _tid, "name": "次要", "color": main.TAG_COLORS[2]}, row
+assert _act("POST", {"action": "set_gallery_tag", "name": "批量A", "tag": "没有的"})["status"] == "error"
+assert _act("POST", {"action": "set_gallery_tag", "name": "没有的库", "tag": ""})["status"] == "error"
+assert _act("POST", {"action": "set_gallery_tag", "name": "批量A", "tag": ""})["tag"] is None
+_row2 = next(x for x in _act("POST", {"action": "list_galleries", "offset": 0, "limit": 20})["galleries"]
+             if x["name"] == "批量A")
+assert _row2["tag"] is None, _row2
+# 删标签连带摘掉图库引用；删图库连带清掉引用
+_act("POST", {"action": "set_gallery_tag", "name": "批量A", "tag": _tid})
+assert _act("POST", {"action": "delete_tag", "id": _tid})["ok"]
+assert g._settings["gallery_tags"] == {} and _tid not in g._settings["tags"], g._settings
+assert _act("POST", {"action": "delete_tag", "id": _tid})["status"] == "error"
+_act("POST", {"action": "create", "name": "标签库"})
+res = _act("POST", {"action": "save_tag", "name": "备用", "color": main.TAG_COLORS[4]})
+assert _act("POST", {"action": "set_gallery_tag", "name": "标签库", "tag": res["id"]})["ok"]
+assert g.delete_gallery("标签库") and g._settings["gallery_tags"] == {}, g._settings
+
+assert g.delete_gallery("批量A") and g.delete_gallery("批量B") and g.delete_gallery("批量C")
+
+# 12j) 图库改名（触发词）：文件夹/内部图片/pid/水印/菜单/标签键一起搬（0.2.1）
+_act("POST", {"action": "create", "name": "改名A"})
+_up("改名A", "95026140_p5.jpg")  # → 改名A-1.jpg，带 pid
+_act("POST", {"action": "set_gallery_menu", "name": "改名A", "show": False, "char": "甲", "group": "功能"})
+_tag_id = _act("POST", {"action": "save_tag", "name": "改名标签", "color": main.TAG_COLORS[6]})["id"]
+assert _act("POST", {"action": "set_gallery_tag", "name": "改名A", "tag": _tag_id})["ok"]
+res = _act("POST", {"action": "rename", "name": "改名A", "new_name": "改名B"})
+assert res["ok"] and res["name"] == "改名B", res
+assert not (g._galleries / "改名A").exists() and (g._galleries / "改名B").is_dir(), res
+assert (g._galleries / "改名B" / "改名B-1.jpg").is_file(), "内部图片应同步改名"
+assert g._pids.get("改名B/改名B-1.jpg") == "95026140_p5" and "改名A/改名A-1.jpg" not in g._pids
+assert g._gallery_menu("改名B") == {"show": False, "char": "甲", "group": "功能"}
+assert g._gallery_tags().get("改名B") == _tag_id, g._gallery_tags()
+# 边界：同名冲突 / 非法字符 / 不存在的库 / 空名；同名 no-op
+_act("POST", {"action": "create", "name": "改名C"})
+assert _act("POST", {"action": "rename", "name": "改名B", "new_name": "改名C"})["status"] == "error"
+assert _act("POST", {"action": "rename", "name": "改名B", "new_name": "../x"})["status"] == "error"
+assert _act("POST", {"action": "rename", "name": "没有的库", "new_name": "y"})["status"] == "error"
+assert _act("POST", {"action": "rename", "name": "改名B", "new_name": "  "})["status"] == "error"
+assert _act("POST", {"action": "rename", "name": "改名B", "new_name": "改名B"})["ok"]
+assert g.delete_gallery("改名B") and g.delete_gallery("改名C")
+
+# 12k) 文件名同步：重排成连续编号（跳号收紧）、乱名规范化，pid 跟文件走不错配
+# 注意 changed 是全库计数（前面用例手工造过同编号不同后缀/跳号），所以断言只针对目标库的最终结果
+_act("POST", {"action": "create", "name": "同步库"})
+_up("同步库", "95026140_p9.jpg")  # → 同步库-1.jpg
+(g._galleries / "同步库" / "乱的.jpg").write_bytes(b"z")
+g._pids["同步库/乱的.jpg"] = "777_p1"
+(g._galleries / "同步库" / "说明.txt").write_bytes(b"t")  # 非图片文件：不动
+res = _act("POST", {"action": "sync_names"})
+assert res["ok"] and res["changed"] >= 1, res
+assert (g._galleries / "同步库" / "同步库-2.jpg").is_file(), res
+assert g._pids.get("同步库/同步库-2.jpg") == "777_p1" and "同步库/乱的.jpg" not in g._pids
+assert (g._galleries / "同步库" / "说明.txt").is_file()
+res = _act("POST", {"action": "sync_names"})
+assert res["changed"] == 0, res  # 已全部合规：不再有改动
+# 跳号收紧：删中间一张后 1,3 → 1,2，pid 跟着文件走（不按名字错配）
+assert g.delete_image("同步库", "同步库-1.jpg")   # 剩 同步库-2.jpg（pid 777_p1）
+res = _act("POST", {"action": "upload", "name": "同步库",
+                    "files": [{"name": "b.jpg", "data": base64.b64encode(b"b").decode()}]})
+assert res["saved"][0]["file"] == "同步库-3.jpg", res   # 上传编号 = 现有最大编号 + 1（跳号不回填）
+(g._galleries / "同步库" / "同步库-3.jpg").rename(g._galleries / "同步库" / "同步库-9.jpg")  # 造跳号
+res = _act("POST", {"action": "sync_names"})
+assert res["changed"] == 2, res                              # 2→1、9→2，两个都动了
+names = sorted(p.name for p in (g._galleries / "同步库").iterdir() if p.suffix.lower() in main.EXTS)
+assert names == ["同步库-1.jpg", "同步库-2.jpg"], names       # 重排成连续编号
+# pid 跟的是**文件**不是编号：带 pid 的那张从 2 号挪到 1 号，pid 跟着它走，另一张不继承
+assert g._pids.get("同步库/同步库-1.jpg") == "777_p1", g._pids
+assert "同步库/同步库-2.jpg" not in g._pids, g._pids
+assert g.delete_gallery("同步库")
+
+# 12l) 同编号不同后缀重排不得互相覆盖（pid 不错配）
+_act("POST", {"action": "create", "name": "后缀库"})
+(g._galleries / "后缀库" / "后缀库-1.jpg").write_bytes(b"a")
+(g._galleries / "后缀库" / "后缀库-1.png").write_bytes(b"b")
+(g._galleries / "后缀库" / "后缀库-2.png").write_bytes(b"c")
+g._pids["后缀库/后缀库-1.jpg"] = "111_p0"
+g._pids["后缀库/后缀库-1.png"] = "222_p0"
+g._pids["后缀库/后缀库-2.png"] = "333_p0"
+res = _act("POST", {"action": "sync_names"})
+assert res["changed"] == 2, res                       # 1.jpg 名字不变；另两张顺延
+names = sorted(p.name for p in (g._galleries / "后缀库").iterdir())
+assert names == ["后缀库-1.jpg", "后缀库-2.png", "后缀库-3.png"], names
+assert (g._galleries / "后缀库" / "后缀库-1.jpg").read_bytes() == b"a"
+assert (g._galleries / "后缀库" / "后缀库-2.png").read_bytes() == b"b"
+assert (g._galleries / "后缀库" / "后缀库-3.png").read_bytes() == b"c"
+assert g._pids["后缀库/后缀库-1.jpg"] == "111_p0" and g._pids["后缀库/后缀库-2.png"] == "222_p0" \
+       and g._pids["后缀库/后缀库-3.png"] == "333_p0", g._pids
+assert g.delete_gallery("后缀库")
+
+# 12m) 列表排序按编号数值（kw-10 不排到 kw-2 前面）
+_act("POST", {"action": "create", "name": "排序库"})
+for _n in (2, 10, 1):
+    (g._galleries / "排序库" / f"排序库-{_n}.jpg").write_bytes(b"x")
+res = _act("POST", {"action": "list_images", "name": "排序库", "offset": 0, "limit": 50})
+assert [im["file"] for im in res["images"]] == ["排序库-1.jpg", "排序库-2.jpg", "排序库-10.jpg"], res["images"]
+assert g.delete_gallery("排序库")
 
 shutil.rmtree(_tmp)
 print("selftest OK")
