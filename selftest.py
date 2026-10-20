@@ -41,7 +41,7 @@ _mod("astrbot")
 
 event_mod = _mod("astrbot.api.event", AstrMessageEvent=object, filter=types.SimpleNamespace())
 filter_ns = event_mod.filter
-filter_ns.EventMessageType = types.SimpleNamespace(ALL=0)
+filter_ns.EventMessageType = types.SimpleNamespace(ALL=0, GROUP_MESSAGE=1, PRIVATE_MESSAGE=2)
 filter_ns.PermissionType = types.SimpleNamespace(ADMIN=0)
 
 
@@ -73,6 +73,12 @@ _mod("astrbot.api.web",
 
 sys.path.insert(0, str(Path(__file__).parent))
 import main  # noqa: E402
+
+# 0c) 关键词入口监听群聊和私聊，但不抢占其他事件。
+_main_text = (Path(__file__).parent / "main.py").read_text("utf-8")
+assert "EventMessageType.GROUP_MESSAGE" in _main_text
+assert "EventMessageType.PRIVATE_MESSAGE" in _main_text
+assert "EventMessageType.ALL" not in _main_text
 
 # 1) pid 识别：纯数字 或 数字_p数字
 assert main.PID_RE.fullmatch("95026140") and main.PID_RE.fullmatch("95026140_p3")
@@ -628,9 +634,12 @@ except ImportError:
     _HAS_PYPINYIN = False
 if _HAS_PYPINYIN:
     assert pk("爱姿") < pk("安比"), (pk("爱姿"), pk("安比"))  # 真拼音 ai < an（GBK 近似会把这条排反）
-    assert main.GalleryPlus._letter_of("芙兰朵露") == "F", main.GalleryPlus._letter_of("芙兰朵露")  # 生僻字（GBK 二级）
 else:
-    print("(无 pypinyin，跳过生僻字拼音用例，GBK 近似生效)")
+    print("(无 pypinyin，跳过生僻字拼音用例，GBK 法生效)")
+# GBK 逐字表：薇/芙（二级字）、橘（扩展区）旧区间法全部错归 z，装不装 pypinyin 都必须归对字母
+assert main.GalleryPlus._letter_of("薇薇安") == "W", main.GalleryPlus._letter_of("薇薇安")
+assert main.GalleryPlus._letter_of("橘福福") == "J", main.GalleryPlus._letter_of("橘福福")
+assert main.GalleryPlus._letter_of("芙兰朵露") == "F", main.GalleryPlus._letter_of("芙兰朵露")
 (g._galleries / "泽塔照片").mkdir(exist_ok=True)
 (g._galleries / "安比照片").mkdir(exist_ok=True)
 names, _n = g.list_gallery_names()
@@ -640,18 +649,45 @@ assert order.index("安比照片") < order.index("泽塔照片"), order  # 安(a
 # 12) 图库菜单（0.2.0）：每库配置 / 分区与字母分组 / API / 渲染几何 / 背景图
 _act("POST", {"action": "create", "name": "菜单库"})
 res = _act("POST", {"action": "get_gallery_menu", "name": "菜单库"})
-assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人"}, res  # 缺省：进菜单、角色名=关键词、个人
+assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人",
+                       "y_start": "", "y_end": "", "y_month": False}, res  # 缺省：进菜单、角色名=关键词、个人、无年份
 res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库",
                     "show": False, "char": "小可琳", "group": "团体"})
-assert res["menu"] == {"show": False, "char": "小可琳", "group": "团体"}, res
+assert res["menu"] == {"show": False, "char": "小可琳", "group": "团体",
+                       "y_start": "", "y_end": "", "y_month": False}, res
 assert json.loads((_tmp / "settings.json").read_text("utf-8"))["gallery_menu"]["菜单库"]["group"] == "团体"
-# 非法分组回落「个人」；角色名留空回落关键词
+# 非法分组回落「个人」；角色名留空回落关键词；不带 y_* 字段=保留原值（批量页整行保存不抹年份）
 res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库",
                     "show": True, "char": "  ", "group": "不存在"})
-assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人"}, res
+assert res["menu"] == {"show": True, "char": "菜单库", "group": "个人",
+                       "y_start": "", "y_end": "", "y_month": False}, res
 for bad in ("../x", "不存在"):  # 防穿越 / 不存在的库
     assert _act("POST", {"action": "get_gallery_menu", "name": bad})["status"] == "error"
     assert _act("POST", {"action": "set_gallery_menu", "name": bad})["status"] == "error"
+
+# 12a) 图库年份（0.2.3）：设置/读回/非法拒绝；_year_text 与 years 菜单数据
+res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": True, "char": "菜单库",
+                    "group": "个人", "y_start": "2024", "y_end": "2025"})
+assert res["menu"]["y_start"] == "2024" and res["menu"]["y_end"] == "2025" and res["menu"]["y_month"] is False, res
+assert _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": True,
+                     "char": "菜单库", "group": "个人"})["menu"]["y_start"] == "2024"  # 不带 y_* 保留
+res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": True, "char": "菜单库",
+                    "group": "个人", "y_start": 2024, "y_end": 2025})
+assert res["menu"]["y_start"] == "2024" and res["menu"]["y_end"] == "2025", res  # JSON 数字也认
+for bad in ({"y_start": "2024", "y_end": "abc"}, {"y_start": "2024", "y_end": ""}, {"y_start": "2025", "y_end": "2024"},
+            {"y_start": "2024-01", "y_end": "2024-05"}):
+    r = _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": True, "char": "菜单库",
+                      "group": "个人", **bad})
+    assert r["status"] == "error", (bad, r)  # 非法 / 单边 / 起晚于止 / 没开月却填月
+res = _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": True, "char": "菜单库",
+                    "group": "个人", "y_start": "2024-1", "y_end": "2024-05", "y_month": True})
+assert res["menu"]["y_start"] == "2024-01" and res["menu"]["y_end"] == "2024-05" and res["menu"]["y_month"] is True, res
+assert main.GalleryPlus._year_text(res["menu"]) == "2024.01~2024.05"
+assert main.GalleryPlus._year_text({"y_start": "2024", "y_end": "2025"}) == "2024-2025"
+assert main.GalleryPlus._year_text({"y_start": "2024", "y_end": ""}) is None
+data = g._menu_data(years=True)
+assert ("菜单库", "2024.01~2024.05") in data["个人"] and all(data[g2] == [] for g2 in ("团体", "功能")), data
+assert g._menu_data()["个人"][0][1] != "2024.01~2024.05"  # 普通菜单第二项仍是关键词
 
 # 分区与字母：安→A、可→K；排序按角色名拼音；分组按配置
 for kw, char, grp in (("可琳照片", "可琳", "个人"), ("安比照片", "安比", "个人"),
@@ -660,6 +696,8 @@ for kw, char, grp in (("可琳照片", "可琳", "个人"), ("安比照片", "�
     (g._galleries / kw / f"{kw}-1.jpg").write_bytes(b"x")
     _act("POST", {"action": "set_gallery_menu", "name": kw, "show": True, "char": char, "group": grp})
 assert main.GalleryPlus._letter_of("可琳") == "K" and main.GalleryPlus._letter_of("安比") == "A"
+_act("POST", {"action": "set_gallery_menu", "name": "可琳照片", "show": True, "char": "可琳",
+              "group": "个人", "y_start": "2024", "y_end": "2025-02", "y_month": True})  # 年份菜单有内容可画
 assert main.GalleryPlus._letter_of("123") == "#"
 data = g._menu_data()
 _act("POST", {"action": "set_gallery_menu", "name": "菜单库", "show": False, "char": "菜单库", "group": "个人"})
@@ -785,6 +823,7 @@ try:
     g._settings["menu"].pop("bg", None)
     (g._root / "menu_bg.png").unlink()
     g._save_settings()
+    assert g._render_menu(1752, years=True) is not None, "年份菜单（图库时间段）应能渲染"
     print(f"菜单渲染 OK: {W}x{H}（页眉/分区条/三列/字母/页脚/背景图均通过）")
 except ImportError:
     print("(无 PIL，跳过菜单渲染检查)")
@@ -799,6 +838,12 @@ async def _drain(gen):
 
 
 out = asyncio.run(_drain(g.on_message(_Ev("图片帮助"))))
+assert out and out[0][0] == "chain", out
+
+# 12b+) 图库时间段：带前缀与裸发都应出年份菜单图
+out = _run_command(g.cmd_year(_Ev("/图库时间段")))
+assert out and out[0][0] == "chain", out
+out = asyncio.run(_drain(g.on_message(_Ev("图库时间段"))))
 assert out and out[0][0] == "chain", out
 
 # 12c) 管理页与后端的一致性（改 id / 改 action 名最易漏的地方）；pages 下每个页面都查
@@ -818,7 +863,8 @@ assert "图片帮助" in _page_html and main.MENU_CMD in _main_src
 # 12d) 批量设置页：全部图库的 水印+菜单配置 一次给全
 res = _act("POST", {"action": "list_all_settings"})
 _rows = {r["name"]: r for r in res["galleries"]}
-assert _rows["菜单库"]["menu"] == {"show": False, "char": "菜单库", "group": "个人"}, _rows.get("菜单库")
+assert _rows["菜单库"]["menu"] == {"show": False, "char": "菜单库", "group": "个人",
+                                  "y_start": "2024-01", "y_end": "2024-05", "y_month": True}, _rows.get("菜单库")  # 批量保存只动三件套，年份保留
 assert _rows["菜单库"]["wm"] is True, _rows.get("菜单库")           # 没动过的库缺省开水印
 assert _rows["可琳照片"]["count"] > 0, _rows.get("可琳照片")  # 前序用例导入过 2 张
 assert set(_rows["菜单库"]) == {"name", "count", "wm", "tag", "menu"}, _rows["菜单库"]
@@ -963,7 +1009,8 @@ assert g.delete_gallery("批量A") and g.delete_gallery("批量B") and g.delete_
 # 12j) 图库改名（触发词）：文件夹/内部图片/pid/水印/菜单/标签键一起搬（0.2.1）
 _act("POST", {"action": "create", "name": "改名A"})
 _up("改名A", "95026140_p5.jpg")  # → 改名A-1.jpg，带 pid
-_act("POST", {"action": "set_gallery_menu", "name": "改名A", "show": False, "char": "甲", "group": "功能"})
+_act("POST", {"action": "set_gallery_menu", "name": "改名A", "show": False, "char": "甲", "group": "功能",
+              "y_start": "2023", "y_end": "2024"})
 _tag_id = _act("POST", {"action": "save_tag", "name": "改名标签", "color": main.TAG_COLORS[6]})["id"]
 assert _act("POST", {"action": "set_gallery_tag", "name": "改名A", "tag": _tag_id})["ok"]
 res = _act("POST", {"action": "rename", "name": "改名A", "new_name": "改名B"})
@@ -971,7 +1018,8 @@ assert res["ok"] and res["name"] == "改名B", res
 assert not (g._galleries / "改名A").exists() and (g._galleries / "改名B").is_dir(), res
 assert (g._galleries / "改名B" / "改名B-1.jpg").is_file(), "内部图片应同步改名"
 assert g._pids.get("改名B/改名B-1.jpg") == "95026140_p5" and "改名A/改名A-1.jpg" not in g._pids
-assert g._gallery_menu("改名B") == {"show": False, "char": "甲", "group": "功能"}
+assert g._gallery_menu("改名B") == {"show": False, "char": "甲", "group": "功能",
+                                    "y_start": "2023", "y_end": "2024", "y_month": False}  # 菜单键（含年份）随改名一起搬
 assert g._gallery_tags().get("改名B") == _tag_id, g._gallery_tags()
 # 边界：同名冲突 / 非法字符 / 不存在的库 / 空名；同名 no-op
 _act("POST", {"action": "create", "name": "改名C"})

@@ -341,6 +341,10 @@ textarea{font-family:inherit;resize:vertical}
     <label class="fld">所属分组（点右侧箭头展开选择，或直接输入筛选）
       <input id="mm-group" list="group-dl" spellcheck="false" autocomplete="off">
     </label>
+    <label class="fld">年份范围（「图库时间段」指令用；留空 = 不显示）
+      <span class="bar"><input id="mm-y0" placeholder="2024" spellcheck="false" style="flex:1"><span>~</span><input id="mm-y1" placeholder="2025" spellcheck="false" style="flex:1"></span>
+    </label>
+    <label class="fld"><input type="checkbox" id="mm-ym"> 精确到月（按 2024-01 格式填写）</label>
     <div class="bar" style="margin:12px 0 0">
       <button id="mm-ok">保存</button>
       <button id="mm-cancel">取消</button>
@@ -805,14 +809,18 @@ async function openMenuCfg(name){
   $('#mm-show').checked = m.show !== false;   // 缺省进菜单
   $('#mm-char').value = m.char || name;
   $('#mm-group').value = ['个人','团体','功能'].includes(m.group) ? m.group : '个人';
+  $('#mm-y0').value = m.y_start || ''; $('#mm-y1').value = m.y_end || '';
+  $('#mm-ym').checked = m.y_month === true;
   $('#menu-modal').hidden = false;
 }
 $('#gal-menu-btn').onclick = () => run(() => openMenuCfg(S.gal));
 $('#mm-ok').onclick = () => run(async () => {
   const gv = $('#mm-group').value.trim();  // 输入框可能打出枚举外的值：不认的回落「个人」
   const t = toast('正在保存菜单设置…');
-  await act({action:'set_gallery_menu', name:mmGal, show:$('#mm-show').checked,
-             char:$('#mm-char').value.trim(), group: GROUPS.includes(gv) ? gv : '个人'});
+  const res = await act({action:'set_gallery_menu', name:mmGal, show:$('#mm-show').checked,
+             char:$('#mm-char').value.trim(), group: GROUPS.includes(gv) ? gv : '个人',
+             y_start:$('#mm-y0').value.trim(), y_end:$('#mm-y1').value.trim(), y_month:$('#mm-ym').checked});
+  if (pick(res, 'status') === 'error'){ toastDone(t, pick(res, 'message') || '保存失败'); return; }  // 年份非法：弹窗留着别关
   $('#menu-modal').hidden = true;
   toastDone(t, `已保存「${mmGal}」的菜单设置`);
 });
