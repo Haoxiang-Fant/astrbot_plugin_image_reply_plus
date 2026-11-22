@@ -73,11 +73,11 @@ function row(g){
   tr.dataset.name = g.name;
   const q = s => tr.querySelector(s);
   tr.innerHTML = `<td><span class="nm" title="${esc(g.name)}">${esc(g.name)}</span></td>
-    <td>${g.count}</td>
-    <td class="ctr"><input type="checkbox" class="wm"${g.wm ? ' checked' : ''}></td>
-    <td class="ctr"><input type="checkbox" class="show"${g.menu.show ? ' checked' : ''}></td>
+    <td>${esc(g.count)}</td>
+    <td class="ctr"><input type="checkbox" class="wm"${esc(g.wm ? ' checked' : '')}></td>
+    <td class="ctr"><input type="checkbox" class="show"${esc(g.menu.show ? ' checked' : '')}></td>
     <td><input type="text" class="char" value="${esc(g.menu.char)}" spellcheck="false"></td>
-    <td><select class="group">${GROUPS.map(x => `<option${x === g.menu.group ? ' selected' : ''}>${x}</option>`).join('')}</select></td>`;
+    <td><select class="group">${GROUPS.map(x => `<option${esc(x === g.menu.group ? ' selected' : '')}>${esc(x)}</option>`).join('')}</select></td>`;
   const menuSave = () => {
     clearTimeout(savers.get(g.name));
     savers.set(g.name, setTimeout(() => run(async () => {

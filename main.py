@@ -28,8 +28,10 @@ import os
 import random
 import re
 import shutil
+import threading
 import time
 import uuid
+import zipfile
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -86,22 +88,30 @@ except ImportError:
             return {"status": "error", "message": message, "data": data or {}}
 
 PLUGIN_NAME = "astrbot_plugin_image_reply_plus"
-PLUGIN_VERSION = "0.2.3"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
+PLUGIN_VERSION = "0.3.0"  # 唯一出处：@register 与 metadata.yaml 的 version 都用它（selftest 校验一致）
 PLUGIN_AUTHOR = "Haoxiang-Fant"  # 同上：@register 与 metadata.yaml 的 author 都用它
 PLUGIN_REPO = "https://github.com/Haoxiang-Fant/astrbot_plugin_image_reply_plus"
 PID_RE = re.compile(r"^\d+(_p\d+)?$")  # 纯数字 或 数字_p数字（整名即 pid）
 PID_ANY_RE = re.compile(r"(\d+)_p(\d+)")  # 名字里嵌的 pixiv 签名（pximg 的 _master1200、PixEz 模板的作者/标题前后缀）
 PID_PREFIX_RE = re.compile(r"^(?:illust|pixiv)[_-](\d+)", re.I)  # illust_/pixiv_ 前缀
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-# 批量导入的"积木"：占位符 → 正则片段。/ {格式} 与 {扩展名} 等价。
+EXTS_TUP = tuple(EXTS)  # str.endswith 只吃元组/字符串；scandir 快速通道按名过滤用
+# 批量导入的"积木"：占位符 → 正则片段。/ {格式} 与 {扩展名} 等价；{间隔符} = 任意一个常见分隔符
+# （- + _ . 空格，可缺席），能出现多次所以不起名捕获。
 FILENAME_BLOCKS = {
     "图库名": r"(?P<kw>.+?)",
     "编号": r"(?P<num>\d+)",
     "pid": r"(?P<pid>\d+(?:_p\d+)?)",
     "扩展名": r"(?P<ext>[A-Za-z0-9]+)",
     "格式": r"(?P<ext>[A-Za-z0-9]+)",
+    "间隔符": r"[-+_ .]?",
 }
 BLOCK_RE = re.compile(r"\{(" + "|".join(FILENAME_BLOCKS) + r")\}")
+
+# 批量导入验收流：图片先落暂存区 temp/import/__导入_<kw>/，按验收页「返回」才并入正式图库；
+# pid/统计键用 "__导入_<kw>/文件名"（_safe_kw 不允许 "/"，与正式图库键空间天然隔离）。
+# ponytail: 暂存只有一份命名空间（不带会话号）——上次没验收的残留会在下一次验收里一起并掉，不另做清理任务。
+IMP_PREFIX = "__导入_"
 
 
 def build_filename_regex(pattern: str):
@@ -109,15 +119,197 @@ def build_filename_regex(pattern: str):
 
     例："{图库名}-{编号}.{扩展名}" → 可琳照片-1.jpg → kw=可琳照片
     匹配时：含扩展名块匹配完整文件名，否则匹配去扩展名的 stem。
+    块之间的固定内容按「可缺席」编译（(?:…)?）：验收页改名后固定字符可以不在文件名里
+    （设计稿：图库名123=图库名），旧格式串里的分隔符也因此更宽容。
     """
     has_ext = "{扩展名}" in pattern or "{格式}" in pattern
     chunks, pos = [], 0
     for m in BLOCK_RE.finditer(pattern):
-        chunks.append(re.escape(pattern[pos : m.start()]))
+        lit = pattern[pos : m.start()]
+        if lit:
+            chunks.append("(?:" + re.escape(lit) + ")?")
         chunks.append(FILENAME_BLOCKS[m.group(1)])
         pos = m.end()
-    chunks.append(re.escape(pattern[pos:]))
+    lit = pattern[pos:]
+    if lit:
+        chunks.append("(?:" + re.escape(lit) + ")?")
     return re.compile("".join(chunks)), has_ext
+
+
+# ---------------- 实时磁盘监控（任务弹窗四格：使用率/读速/写速/平均响应，1s 轮询） ----------------
+# 「磁盘使用率」= 磁盘活动时间占比（Task Manager 的 Active time，%），**不是空间占用**；
+# 与任务累计量（bytes_r/bytes_w/op_ms）分开：那三个是「本任务已做的量」，这里是「整机当前窗」。
+# 采样必须是常数级、线程安全、绝不抛异常（前端轮询期间任何异常都会让整个 xfer_status 500）。
+_DISK_IO_LOCK = threading.Lock()
+_DISK_IO_GAP = 5.0  # 采样间隔上限：超过它旧基线作废（长窗口的平均值既不是「当前速率」也会显得像尖峰）
+_PDH_PATHS = (
+    r"\PhysicalDisk(_Total)\Disk Read Bytes/sec",
+    r"\PhysicalDisk(_Total)\Disk Write Bytes/sec",
+    r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer",
+    r"\PhysicalDisk(_Total)\% Disk Time",  # 磁盘活动时间占比（= 任务管理器「活动时间」，不是空间占用）
+)
+# Windows：PDH 查询句柄进程级缓存（PDH 速率靠两次 Collect 的时间差算，复用句柄才拿得到「当前速率」）
+_PDH_STATE: Dict[str, Any] = {"pdh": None, "fmt": None, "query": None, "counters": None, "failed": False}
+# Linux：上一次 /proc/diskstats 快照（设备名 → 原始计数），用于算窗口增量
+_LINUX_DISK_STATE: Dict[str, Any] = {"t": None, "devs": None}
+# /sys/block 里这些是虚拟/非物理设备：loop/ram/zram/dm/sr/fd/md/nbd/rbd 与裸设备分区条（mmcblk0boot 等）
+_LINUX_VIRTUAL = ("loop", "ram", "zram", "dm-", "sr", "fd", "md", "nbd", "rbd",
+                  "mmcblk0boot", "mmcblk0rpmb")
+
+
+def _pdh_init() -> None:
+    """懒初始化 PDH 查询与四个计数器（调用方持 _DISK_IO_LOCK）；失败置 failed，之后直接走 None。"""
+    import ctypes
+
+    st = _PDH_STATE
+
+    class _Fmt(ctypes.Structure):  # PDH_FMT_COUNTERVALUE（union 的 doubleValue 分支，偏移 8）
+        _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+    try:
+        pdh = ctypes.WinDLL("pdh")
+        pdh.PdhOpenQueryW.argtypes = [ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+        pdh.PdhOpenQueryW.restype = ctypes.c_long
+        pdh.PdhCollectQueryData.argtypes = [ctypes.c_void_p]
+        pdh.PdhCollectQueryData.restype = ctypes.c_long
+        pdh.PdhGetFormattedCounterValue.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(_Fmt)]
+        pdh.PdhGetFormattedCounterValue.restype = ctypes.c_long
+        # 中文系统也要能用英文计数器名：PdhAddEnglishCounterW 是 Vista+ 的接口，极老系统退本地化接口
+        add = getattr(pdh, "PdhAddEnglishCounterW", None) or pdh.PdhAddCounterW
+        add.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+        add.restype = ctypes.c_long
+        q = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(q)) != 0:
+            raise OSError("PdhOpenQueryW 失败")
+        counters = []
+        for name in _PDH_PATHS:
+            c = ctypes.c_void_p()
+            counters.append(c if add(q, name, 0, ctypes.byref(c)) == 0 else None)
+        st.update({"pdh": pdh, "fmt": _Fmt, "query": q, "counters": counters, "failed": False})
+    except Exception:
+        st.update({"pdh": None, "fmt": None, "query": None, "counters": None, "failed": True})
+
+
+def _disk_monitor_win():
+    """Windows：PDH 拿整机 (=_Total) 读/写速率、平均响应、活动时间占比。
+
+    返回 (r_bps, w_bps, resp_ms, busy_pct)；PDH 首样本无效时对应项为 None。
+    """
+    import ctypes
+
+    st = _PDH_STATE
+    with _DISK_IO_LOCK:  # PDH 句柄/Collect 非线程安全，且值要与本次 Collect 对齐，整段串行
+        if st["query"] is None and not st["failed"]:
+            _pdh_init()
+        if st["failed"]:
+            return None, None, None, None
+        try:
+            pdh, fmt_cls, q, counters = st["pdh"], st["fmt"], st["query"], st["counters"]
+            if pdh.PdhCollectQueryData(q) != 0:  # 每次轮询都 Collect：速率 = 距上次调用这一窗
+                return None, None, None, None
+            vals: List[Optional[float]] = []
+            for c in counters:
+                if not c:  # 该计数器在本机不可用（缺计数器/权限）
+                    vals.append(None)
+                    continue
+                typ = ctypes.c_ulong()
+                val = fmt_cls()
+                rc = pdh.PdhGetFormattedCounterValue(c, 0x00000200, ctypes.byref(typ), ctypes.byref(val))  # PDH_FMT_DOUBLE
+                v = val.doubleValue
+                # CStatus 0=VALID_DATA、1=NEW_DATA 都是有效；首个样本是 0xC0000BBA(INVALID_DATA) → None
+                ok = rc == 0 and val.CStatus in (0, 1) and v == v and v >= 0
+                vals.append(float(v) if ok else None)
+        except Exception:
+            return None, None, None, None
+    r, w, s, busy = vals
+    return (r, w,
+            (s * 1000.0 if s is not None else None),  # Avg. Disk sec/Transfer：秒 → 毫秒
+            (min(100.0, busy) if busy is not None else None))  # % Disk Time 可能 >100（多盘合计），夹到 100
+
+
+def _linux_disk_sample() -> Dict[str, tuple]:
+    """读 /proc/diskstats 汇总物理盘原始计数：设备名 → (sectors_r, ms_r, reads, sectors_w, ms_w, writes)。"""
+    devs: Dict[str, tuple] = {}
+    try:
+        block = set(os.listdir("/sys/block"))
+    except OSError:
+        block = None  # 没有 /sys 就只按前缀排除虚拟设备
+    with open("/proc/diskstats", "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 11:  # 老内核字段更少，算不出响应时间就整行跳过
+                continue
+            name = parts[2]
+            if name.startswith(_LINUX_VIRTUAL):
+                continue
+            if block is not None and name not in block:
+                continue  # 只认整盘，排除分区（sda1 之类）
+            try:
+                devs[name] = (int(parts[5]), int(parts[6]), int(parts[3]),
+                              int(parts[9]), int(parts[10]), int(parts[7]))
+            except ValueError:
+                continue
+    return devs
+
+
+def _disk_monitor_linux():
+    """Linux：/proc/diskstats 窗口增量算读/写字节每秒、平均每次 IO 响应毫秒、活动时间占比。
+
+    返回 (r_bps, w_bps, resp_ms, busy_pct)；首次/长间隔/热插拔返回四个 None。
+    """
+    try:
+        t0 = time.monotonic()
+        cur = _linux_disk_sample()
+        with _DISK_IO_LOCK:
+            prev, prev_t = _LINUX_DISK_STATE["devs"], _LINUX_DISK_STATE["t"]
+            _LINUX_DISK_STATE["devs"], _LINUX_DISK_STATE["t"] = cur, t0
+        if not prev or prev_t is None:
+            return None, None, None, None  # 首次调用只建基线
+        dt = t0 - prev_t
+        # 长间隔（页面挂后台）/设备热插拔（集合变了）：旧基线不可比，本次只重建基线
+        if dt <= 0 or dt > _DISK_IO_GAP or set(cur) != set(prev):
+            return None, None, None, None
+        d_r = d_w = d_ms = d_ops = 0
+        for name, vals in cur.items():
+            old = prev[name]
+            d = tuple(vals[i] - old[i] for i in range(6))
+            if any(x < 0 for x in d):  # 计数器回绕/重置：作废本次
+                return None, None, None, None
+            d_r += d[0]
+            d_ms += d[1]
+            d_ops += d[2]
+            d_w += d[3]
+            d_ms += d[4]
+            d_ops += d[5]
+        # 活动时间 = 窗口内读/写各花了多少毫秒 / 窗口毫秒（多盘叠加可能 >100，夹到 100）
+        busy = min(100.0, d_ms / (dt * 10.0))
+        return (d_r * 512.0 / dt, d_w * 512.0 / dt,
+                (d_ms / d_ops) if d_ops > 0 else None, busy)  # 无 IO 完成 = 响应时间无意义
+    except Exception:
+        return None, None, None, None
+
+
+def disk_monitor() -> dict:
+    """整机实时磁盘监控：{"usage": 活动时间%, "r_bps": B/s, "w_bps": B/s, "resp_ms": ms}。
+
+    四键固定、值可为 None；usage = 磁盘活动时间占比（不是空间占用），平台不支持时 None。
+    r_bps/w_bps/resp_ms 是「自上次调用以来」的整机窗口值（前端每 1s 轮询一次）。
+    任何采样异常都退成 None，绝不向调用方抛异常（不能拖垮 xfer_status）。
+    """
+    out: Dict[str, Any] = {"usage": None, "r_bps": None, "w_bps": None, "resp_ms": None}
+    try:
+        if os.name == "nt":
+            r, w, resp, busy = _disk_monitor_win()
+        else:  # POSIX：Linux 有 /proc/diskstats；其它 POSIX 读不到文件 → 四个字段 None
+            r, w, resp, busy = _disk_monitor_linux()
+        out.update(r_bps=r, w_bps=w, resp_ms=resp,
+                   usage=(min(100.0, max(0.0, busy)) if busy is not None else None))
+    except Exception:
+        pass
+    return out
+
+
 MIME = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
     ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
@@ -160,11 +352,22 @@ _PY_TBL_RAW = (
 ("y", "丣乁乂乊乑乚乛乵乻亄亐亜亞亪亱亴仸伃伇伝伿佁佒侇侌俁俋俹俼倄倻偀偊偐偠偣偤偯傆傊傛傜傟傭傴傿僌僷儀億儥優儼兗兪兿円冘冝凐剈剦劜劮劷勈勚勩勻匇匜匬匽厊厑厓厡厭厳厴厵吔吚呭呹咉哊員唀唈唖唹啘啞啨啱喅喐喓喗喩喭喲営嗂嗈嘢噊噖噞噟噦噮噰噳噾嚈嚘嚚嚥嚴嚶囈囙囦囩圁圎園圓圔圛圠圧圫坄坱垔垚垟垼垽埇埜埡埶堉堐堣堨堬堯堷塋塎塩墕墷墿壄壓壛壧壱夁夗夵夽奫妘妜妟妴姎姲姷姸娛娫娮娯婣婬婭婹媀媐媖媱媴嫄嫈嫕嫗嫛嫞嬄嬊嬑嬟嬩嬮嬰嬳嬽嬿孆孍孧孲孾宎宐宧寃寙寱寲尭岄岆岟峓峟峣峳峾峿崕崟崯崳崵崸崺嵃嵎嵒嵓嵱嶎嶖嶢嶤嶧嶪嶫嶬嶼嶽嶾巊巌巖巗巘巚巸帟帠幆庌庘庡庮庽廕廙廮廱弇弌弬彛彜彞彟彠彥彧彮応忬怈怣怮怺恞恱悀悁悅悆悘悥惌惐惥惲愑愔愝愥愪愮愹慂慃慇慍慭慾憂憖憗憶應懌懕懙懚懨懩懮戉戫戭扅扆扊扜扵抁抈抎抣抭抰抴拸挜挧捓捙捳掗掜揅揘揚揜揺搖摬摿撎擁擛擨擪擫攁攍攖攺敔敡敥敭敼斁斔斞斦斿旑旕旟旸昖昜晹暆暈暍暎暘暚暥曀曄曅曎曕曗曣曮曱曵朄朠杅杙杬枍枒枖枟枻枼枽柂柍柡柼栐栘栧栯栶栺桋桙桜梄梬棛棜棩棪棫棭椏椬椸椻椼楀楆楊楌楡楢楧楪業楰榏榚榞榣榬様槦槱槸樣樮橒檃檍檥檭檹檼檿櫌櫞櫩櫲櫻櫽櫾櫿欎欕欝欥欭歅歈歋歝歟歶殀殔殗殞殥殹毉氜氬氱氳沄沇沋沶泆泑泿洂洕洢浂浟浥浧浳涢淊淢淯淵淾渁渆渏渕渰渶渷湙湚湡湧湲湵溁溋溎溒溔溳溵滛滧滪滺滽漁漄漜漹潁潏潩潱澐澚澞澦澭澲澺濙濚濥濦濴瀀瀁瀅瀠瀯瀴瀷灁灉灎灐灔灜灧灩灪炈炴烎烑烻焑焔焲焴煐煙煬煴熅熉熎熒熖熤熪熼燁燄燏燚營燡燱燿爓爗爚爩爺牅牏牗牪牰犽犾狋狕狖狿猌猒猚猨猰猶猺獂獄獈獟玗玙玡玥玴珆珚珜珢珱琂琙瑀瑘瑤瑩瑿璌璍璵瓔瓵甇甖甗畇畩畭異痬瘂瘉瘍瘖瘞瘱癊癒癕癢癭癮癰皣盁豓豔豙豛豷貁貐貖貟貤禺夭爻胤毓厣靥赝卣刈劓伛伢攸佚貽賏賱賹贀贇贋侑佾俨俣俑偃龠兖嬴贏贗贠赟赺趛跀跇讠诒谀谒谕谳邺跠踦踰踴郓郢郾鄢鄞廴壅圯垭垠垸埸躍躽軅軈軉軋軏堙塬墉懿芫芸苡茚茔軮軺軼輍輏輑輢輰輶輿莠莜莸莺萸菸萦蓥蓣轅轙轝辷込迃迆迶迻逌逘薏弈奕尢挹揶揠揄掾撄逰逳逺遃遊運遙遠遹遺邍邎邘邧弋吖吆呓吲呦咦咿郔郵郺郼鄅鄆鄓鄖鄘鄴鄾酀唷喁喑嘤噫囿圄圉酑酓酛酭酳醃醖醞醟醧醫醳醶醷醼釅釔岈峄崦崾嵛嶷徉徭狁狳狺釴釾鈅鈏鈗鈘鈝鈠鈨鈺鈾猗夤饫饴馀庾膺怏怿怡恹鉞鉠鉯銀銉銚銥銦恽悒愠慵闫阈沅泱銪鋆鋊鋙鋣鋺洇湮滟滢潆漪錏錥鍈鍚鍝瀛瀹宥迓迤鬻妍妪鍱鎁鎐鎑鎣鎰鎱妤娅媛嫣驿纡鏔鏞鐊鐚鐛鐭纭缢幺邕琊珧瑛琰鐷鐿鑍鑰钖铔瑜瑗璎韫杳柚桠锳閆閱閲閹閻閾闄闉楹樾橼檐猷殒殪轶轺阥阦阭陓陭陰陻陽隁隂昀昱晔晏曜贻觎隒隕隠隱隿雓雝雲雵霒霙霠氩氤氲牖爰刖肴胭腌腴媵霣霬霱霷靨靷靾靿鞇鞕欤欹於旖炀烨烊焱煜熨熠燠韗韞韺韻韾頁頉恙肀聿砑眢眙睚預頤頥頨頴頵顊顏顒顔顗願顤顩罨钇钰钺铕铘铟颕颙颺颻飏飖飫飮飲飴餆镒镛镱養餘餚餣餫饁饇饐饜甬鸢鹆鹞鹦鹬疣痖痍瘐瘀瘗馌馧馭馻駀駅駌駚駰瘿瘾癔翊窈窬窳衤騐験騕騟騴騵驈驗颍蚓蚰蚴蛘蜮蜴蝓蝣驛驜驠骃骬骮髃螈罂竽筵筠箢鬰鬱鬳魊魘魚魭魷臾舁舣羿翳繇酏鮋鮣鮨鮽鯒酽鯣鯲鰅鰋鰑鰩鰫雩霪龉鼋鱿鱅鱊鱦鲉鲬鳐鳙鞅魇餍饔黝黟鼬鼹"),
 ("z", "丵乲乽乿伀伬伷佂佇佋佔侜侲侳俧倁倊値倧倳偅偡偧偫偵偺傂傤傮傯債傶傽僎僔僽儎儧儨儹兂冑凖凧凪刣則剚劄劅劕劚劧劯匨卆厇厏厔厜叀叕吇呪呰咗咮哫唕唨唶啅啙啠啫喆喌喒喠喿嗞嗭嗺嗻嘖噂噆噡噣噿嚞囀囋囎囐囑圴坁坧坾垁垗埑埩執埻堟堫堹塚塜塟塣塦塼墆墇墌増墜墫墸壯壴壵壿夈夨奓妐妕妝妰妱妷姃姉姕姪娡娤娷娺媑媜嫃嫥嫧嫬嫸嬂孎孨孶宒宔宱寁寊寘専專尰屒岝岞崒崝崢崪崰崱崻嵀嵏嵕嵸嶃嶄嶊嶘嶟嶦嶵巵巶帀帋帪帳幀幒幘幟幥庂庒庢庤廌弉弫張彴彸徏徔徝徟徰徴怾恉悊惉惣惾愡愸慞慥慹憄懥懫戇戝戠戦戰扗扙扺扻抍択抧抮抯拃挃挋挓捑捘捚捴捽掙掟掫揁揔揕揝搃搘搩搱搸搾摠摣摯撍撜撯擆擇擲擳攅攢敶斀斎斬斱斲斵斸旐旘旜昗昣昮晊晝晢晣晫晬晭晸暫暲曌曯朘朡杍枛枬柊柣柤査栆栕栚栥栬栴桘桚桟桭梉梍梔梲梽棁棗棧棳棷棸椊椓椔椥椶楖楨榐榟榰榸槕槜樁樍樜樝樦樴樶樼橏橧橴檇檌檛檡櫂櫍櫛櫡櫧櫫欘歱歵歽殝殶氈氊氶汄汋汥汦汷沚沝沞沢沯泈泎泏泜洅洔洷涱淍淔淛淽渽湞湷湽準溠溨溭滍滯漐漬漲漴潈潌潧潪澤澬澵濁濐濽瀄瀦灂灒灟灷灹災炂炡炢炤炪炿烐烖烝烵焋煄煑煠煰熧熫熷燪燭燳爥爫爭爼牂牐牸犆犳狀狆狣狾猔猘猙猣獉玆珇珎珘琖琸瑑瑧瑱瑵瑼璔璪璻璾瓆瓉瓚瓡甀甃甎甴甽畤畷疐疛疭疷疻痮瘇瘬瘲癥皁皟皶皺皻皽豑豒豬豵貞責貭卮丶仄赜仉伫貯貲資賊賍賑賘賙賛質賬賳賺賾贄贅贈贊侏倬偬俎贓贜赒赱赼趈趙趦趮趲跓冢诏诤诹诼谘谪谮谵阼陟陬跦跩跱踤踨踭踷踿蹔蹠蹤蹧蹱郅邾鄣鄹圳埴躑躓軄転芷苎茱軫軴軸軹軽輈載輊輒輖輙輚輜輺輾轃荮蓁轉轍轏轛辀辠迊迍迣迬蕞奘拶揸搌摭這週遉遧邅摺撙擢攥吒咂咤哳唣唑啧啭啁郮郰鄑鄒鄟鄫鄭鄼帙帻酇酔酖酙酨酻醆醊醡醩釗針釞幛峥崽嵫嶂徵釨鈡鈭鈼鉁鉄獐夂馔忮怍鉊鉒鉔鉙鉦銂銌銍銖惴銸銺銿鋕鋜鋥鋳鋴鋷浈洙浞渚涿潴錊錐錙錚錝錣錱鍐鍘鍣濯迮彘咫鍺鍼鍾鍿鎡鎭鎮鎺鏃姊妯嫜孳驵驺骓骘纣鏓鏨鏱鐏鐕鐘鐟绉缁缒缜缯缵甾鐯鐲鑁鑄鑆鑕鑚鑽鑿钃铚璋瓒杼栉柘枳栀桎桢梓棹锧镃長閘閚楱楂榛槠橥樽轵轸轾辄阤阯陣陼辎臧甑昃昝贽赀赈隲隻雑雜雥霅霌霑霔肫胄胙胗胝朕腙膣靕靻旃炷祉祚祗祯禚韴恣斫砟砦磔黹眦頾頿顓畛罾钊钲铢颭飐飦飵铮锃锱镞镯锺雉秭餟餦饌饘饡稹鸩鸷鹧痄疰痣瘃馲馵馶馽駋駎駐駔駗駤駯駲瘵窀褶耔騅騆騌騣騭騶騺騿驇驏驙颛蚱蛭蜇驟骔髒髽螽蟑竺笊笫笮筝箦箸箴鬇鬉鬒鬷魙魳簪籀舯舳舴粢粽糌翥絷趑趱赭酎鮓鮡鮢鮺鮿鯐鯔鯖酯跖踬踯踵躅躜豸觜鯞鯫鯮鯯鯺鯼鯽鰂鰦觯訾龇隹錾鲰鲻鱁鱄鱆鱒鱛鱡鱣鱵鲊鲗鲝鳟髭麈齄"),
 )
-_PY_TBL = {ch: letter for letter, chars in _PY_TBL_RAW for ch in chars}
+# 惰性构建：1.2 万字的逐字表只在第一次走 GBK 退路（没装 pypinyin）时才展开，
+# 别在 import 时白做一次全表推导（WebUI/插件加载路径上省一笔固定开销）。
+_PY_TBL: Optional[Dict[str, str]] = None
+
+
+def _py_tbl() -> Dict[str, str]:
+    """GBK 二级字 + 扩展区的逐字拼音首字母表；首次使用时构建并缓存（行为与 import 时展开一致）。"""
+    global _PY_TBL
+    if _PY_TBL is None:
+        _PY_TBL = {ch: letter for letter, chars in _PY_TBL_RAW for ch in chars}
+    return _PY_TBL
 
 
 def _gbk_pinyin_key(name: str):
     """pypinyin 没装时的退路：一级字按 GBK 区间、其余按逐字表取拼音首字母（覆盖整个 GBK 常用字）。"""
+    tbl = _py_tbl()
     key = []
     for ch in name or "":
         c = ch.lower()
@@ -177,8 +380,8 @@ def _gbk_pinyin_key(name: str):
             key.append(chr(b[0]).lower())
             continue
         code = (b[0] << 8) | b[1]
-        if ch in _PY_TBL:  # 二级字 + GBK 扩展区：逐字对照
-            key.append(_PY_TBL[ch])
+        if ch in tbl:  # 二级字 + GBK 扩展区：逐字对照
+            key.append(tbl[ch])
             continue
         if code < 0xB0A1 or code >= 0xD8A1:  # 符号区 / 表外生僻字：按原字符排（_letter_of 归「#」）
             key.append(c)
@@ -192,12 +395,34 @@ def _gbk_pinyin_key(name: str):
     return tuple(key)
 
 
+_PINYIN_LAZY = None  # None=还没探测；False=没装 pypinyin；函数=已装（缓存住，避免每次调用都试 import）
+
+
+def _lazy_pinyin():
+    """pypinyin.lazy_pinyin（requirements 自带）或 None；只探测一次。
+
+    没装 pypinyin 时以前每次 pinyin_key 都要走一遍失败的 import（排序几百个名字就是几百次异常），
+    探测结果缓存住，退路 GBK 法不再有这笔固定开销。
+    """
+    global _PINYIN_LAZY
+    if _PINYIN_LAZY is None:
+        try:
+            from pypinyin import lazy_pinyin
+            _PINYIN_LAZY = lazy_pinyin
+        except ImportError:
+            _PINYIN_LAZY = False
+    return _PINYIN_LAZY or None
+
+
+@lru_cache(maxsize=4096)
 def pinyin_key(name: str):
     """图库排序键：逐音节取小写拼音。装了 pypinyin（requirements 自带）生僻字也准；
-    没装退回 GBK 法（GBK 内约 1.65 万字准确，仅极生僻字归「#」，见 _gbk_pinyin_key）。"""
-    try:
-        from pypinyin import lazy_pinyin
-    except ImportError:
+    没装退回 GBK 法（GBK 内约 1.65 万字准确，仅极生僻字归「#」，见 _gbk_pinyin_key）。
+
+    纯函数、输入是有限的图库名/角色名，结果缓存（列表页每次分页排序都按名字取键，别重复算拼音）。
+    """
+    lazy_pinyin = _lazy_pinyin()
+    if lazy_pinyin is None:
         return _gbk_pinyin_key(name)
     key = []
     for syll in lazy_pinyin(name or ""):
@@ -205,15 +430,65 @@ def pinyin_key(name: str):
     return tuple(key)
 
 
-def _stable_cover(kw: str, d: Path, names: List[str]) -> Optional[str]:
+@lru_cache(maxsize=4096)
+def _first_letter(ch: str) -> str:
+    """单字拼音首字母（小写英文字母/数字）；取不到（标点/表外字）返回空串。"""
+    k = pinyin_key(ch)
+    if k and k[0].isascii() and k[0].isalnum():
+        return k[0]
+    return ""
+
+
+@lru_cache(maxsize=2048)
+def role_sort_key(name: str) -> tuple:
+    """批量管理页的图库排序键：按「角色名每个字的拼音首字母」逐字 A→Z 比较。
+
+    排序语义（改需求前先对齐）：
+    - **逐字**取键，元组比较即字典序：先比第一个字的首字母，相同再比第二个，依次类推；
+      不是把整个名字当一个字符串比；
+    - 汉字取拼音**首字母**：装了 pypinyin 用 pypinyin（多音字取常用音、生僻字也准），
+      没装退回现有 GBK 逐字表（_gbk_pinyin_key，覆盖 GBK 内约 1.65 万字）；
+    - 西文字母/数字按自身小写字符逐个比较（拉丁串拆成单字符，不整串当一个元素）；
+    - 空白字符忽略（"阿慈谷 日富美" 与 "阿慈谷日富美" 同键）；其余标点/符号也跳过，
+      免得「·」之类把顺序带偏；全被跳过的名字得到空键，由调用方用 pinyin_key(name) 兜底。
+
+    纯函数结果按名字缓存（角色名是有限的设置值，量级=图库数）：翻页/重复请求不重算拼音。
+    """
+    key: List[str] = []
+    for ch in name or "":
+        if ch.isspace():
+            continue
+        if ch.isascii():
+            c = ch.lower()
+            if c.isalnum():
+                key.append(c)
+            continue
+        c = _first_letter(ch)  # 单字首字母（逐字缓存，pypinyin 只算一次）
+        if c:
+            key.append(c)
+    return tuple(key)
+
+
+def _stable_cover(kw: str, d: Path, names: List[str], mtime: Optional[float] = None) -> Optional[str]:
     """封面稳定随机：种子 = 图库名 + 目录 mtime。
 
     目录内容不变（增删/改名都会动 mtime）→ 每次列表取到同一张，前端缓存不失效；
     内容一变 → 自然换种子，重新随机一次。零存储、零失效钩子。
+    mtime 可选：列表路径已经为了「目录列举缓存」stat 过目录了，把 st_mtime 传进来省一次 stat；
+    不传就自己 stat（保持旧调用/脚本可用），种子仍是 int(秒)，同目录 mtime 下封面与旧实现一致。
     """
     if not names:
         return None
-    return random.Random(f"{kw}:{int(d.stat().st_mtime)}").choice(names)
+    if mtime is None:
+        mtime = d.stat().st_mtime
+    return random.Random(f"{kw}:{int(mtime)}").choice(names)
+
+
+def _hex_color(c) -> str:
+    """RGB 元组 → 小写 #rrggbb（前端 CSS 直接用；与水印方块同一套取色结果）。"""
+    return "#%02x%02x%02x" % (int(c[0]), int(c[1]), int(c[2]))
+
+_HEX_RE = re.compile(r"#[0-9a-f]{6}")  # 主题色缓存值格式：手改坏的盘上缓存不当命中
 
 FONT_CANDIDATES = (
     "simhei.ttf", "msyh.ttc", "simsun.ttc",
@@ -259,7 +534,9 @@ DEFAULT_SYNONYMS = {"照片": ("图片",)}
 DEFAULT_SEND_COUNT = 1
 DEFAULT_FORWARD_THRESHOLD = 3
 MAX_SEND_COUNT = 10
+DEFAULT_MAX_SEND = 10                # 运行设置「单次发送上限」缺省 10（clamp 1..MAX_SEND_COUNT）
 MAX_CONFIG_SEND_COUNT = 5
+EXPORT_CHUNK_MAX = 8 * 1024 * 1024   # 导出 ZIP 分块读取上限：bridge 每次只回一块 base64
 MENU_REF_W = 1752.0                   # 参考样图宽度（测量基准）
 MENU_WIDTH = 1200                     # 发送用菜单图宽度
 MENU_PREVIEW_W = 700                  # WebUI 预览宽度（小图省带宽，版式按比例一致）
@@ -332,8 +609,10 @@ MENU_BG_MAX_MB = 10                    # 顶部背景图大小上限
 MENU_BG_NAME = "menu_bg"               # 背景图文件名前缀（存插件数据目录根）
 MENU_SIZE_MIN, MENU_SIZE_MAX = 50, 200  # 各部件字号的缩放百分比上下限（100 = 参考样式实测值）
 
-# ---------------- 图库颜色标签（0.2.1）----------------
-# 七种预设低饱和度色：管理员只负责命名，颜色固定走这份表（前端取色也只认这七个）。
+# ---------------- 图库颜色标签（0.2.1 / 0.3.0 重做标签管理）----------------
+# 马卡龙色板（16 色）：标签颜色已支持取色器自定义，这份表只负责三件事——
+# ① 标签管理色板第 1 行默认色块（取前 6 个）②「随机一个」的取值池 ③ 缺省新标签颜色。
+# 前 7 个 = 0.2.1 的旧预设色（顺序不动：老数据/老测试的观感与取值一致）。
 TAG_COLORS = (
     "#7FA0B8",  # 雾蓝
     "#8FB59A",  # 灰绿
@@ -342,8 +621,24 @@ TAG_COLORS = (
     "#C9B27F",  # 沙金
     "#B99B7F",  # 驼棕
     "#7FB5AE",  # 青灰
+    "#A8D8D0",  # 薄荷
+    "#F2B5C4",  # 樱花粉
+    "#F7D794",  # 奶油黄
+    "#E8A87C",  # 蜜桃橙
+    "#B8B8E0",  # 薰衣草
+    "#9CC5A1",  # 抹茶
+    "#F0AFA8",  # 珊瑚粉
+    "#9FB7D8",  # 天蓝
+    "#D4C1E0",  # 丁香紫
 )
 TAG_NAME_MAX = 24  # 标签名上限（信任边界，防超长名字撑破卡片/表格）
+TAG_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")  # 信任边界：标签色只收 #rrggbb（可省 #）
+
+
+def _tag_color(value, default: str = "") -> Optional[str]:
+    """颜色入参 → '#rrggbb'（大小写原样保留，CSS 不区分）；不像十六进制色就返回 default（None 表示非法）。"""
+    m = TAG_COLOR_RE.match(str(value or "").strip())
+    return "#" + m.group(1) if m else (default or None)
 
 
 def _menu_size_pct(value) -> int:
@@ -352,6 +647,53 @@ def _menu_size_pct(value) -> int:
         return min(max(int(value), MENU_SIZE_MIN), MENU_SIZE_MAX)
     except (TypeError, ValueError):
         return 100
+
+
+# ---------------- 二维码缓存（水印信息条） ----------------
+# 同一 (作品号, 像素尺寸) 的二维码会被反复用到（同一张图反复发送/悬停预览），segno 生成一次
+# 要几毫秒；缓存后直接复用。上限 64 条，超限按插入顺序最旧淘汰（FIFO）；生成失败不缓存。
+_QR_CACHE: Dict[tuple, Any] = {}
+_QR_CACHE_MAX = 64
+_QR_CACHE_LOCK = threading.Lock()
+
+# ---------------- 封面主题色落盘缓存（主页卡片） ----------------
+# 主题色要解码封面 JPEG，冷启动时一屏 20 张能把首屏拖到 250ms；算过一次就写 temp/themes.json，
+# 下次（重启后的冷首发）直接读回，不再解码。键含封面文件名 + 文件 mtime，换封面/重生成自然换键。
+# 上限 4096 条（量级 = 图库数 × 历史封面数），超限按插入顺序丢最旧，防无界增长。
+THEME_CACHE_MAX = 4096
+
+# 缩略图换名锁：thumb 进线程池后，同一档缩略图可能被两个线程同时生成；Windows 上两个线程对同一
+# 目标同时 os.replace 会偶发 WinError 5（拒绝访问），所以只把「换名」这一步互斥（解码/编码仍并行），
+# 单次 replace 是微秒级，不损失并行度。
+_THUMB_WRITE_LOCK = threading.Lock()
+
+
+def strip_history_images(contexts) -> bool:
+    """就地剥掉 LLM 历史上下文（OpenAI 消息列表）里的 image_url 段；返回是否有改动。
+
+    图库图片只会经「用户引用」进入对话历史，而 AstrBot 每次请求都把历史原样重发给模型
+    （图片是 base64 data URI，全量重传）——图越攒越多，请求越来越慢。剥掉历史里的图后，
+    本次消息刚引用/上传的图走 req.image_urls，不受影响，所以「用户引用了这张图片」时
+    模型本次仍然看得到；被剥掉的图只影响之后的请求。
+    ponytail: 不区分「是不是图库发的图」——历史里只剩 data URI，无路径无元数据认不出原图；
+    一律当「上一轮的旧图」剥掉（需求语义本来就是只保留本次引用的图）。
+    """
+    changed = False
+    if not isinstance(contexts, list):
+        return changed
+    for msg in contexts:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        kept = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
+        if len(kept) != len(content):
+            msg["content"] = kept or [{"type": "text", "text": "[图片]"}]  # 空内容部分平台会报错
+            changed = True
+    return changed
+
+
+# 老版 AstrBot 没有 on_llm_request 钩子：优雅跳过（只失去历史图片剥离，其余功能不受影响）
+_ON_LLM_REQUEST = getattr(filter, "on_llm_request", None)
 
 
 @register(
@@ -383,8 +725,47 @@ class GalleryPlus(Star):
         self._pids: Dict[str, str] = self._load_pids()
         self._settings: Dict[str, Any] = self._load_settings()
         self._stats: Dict[str, Any] = self._load_stats()
+        # 发送计数防抖落盘（0.3.0 性能）：内存即时累加，stats.json 由单飞后台任务异步写。
+        # 原实现每发一张图同步全量 dumps+写盘，堵事件循环（消息处理卡顿来源之一）。
+        self._stats_dirty = False
+        self._stats_task: Optional[asyncio.Task] = None
+        # ponytail: 主页封面的主题色缓存，键=(图库, 封面文件名, 封面 mtime)，失败也缓存兜底色。
+        # 键随封面变化滚新条目（旧条目不淘汰），量级 = 图库数，不设上限。
+        self._theme_cache: Dict[tuple, str] = {}
+        # 消息匹配缓存（0.3.0 性能）：键=(图库名, 角色名, 同义词快照) → 该库展开后的触发词集合。
+        # settings 一变键就变（角色名/同义词都在键里），_save_settings/建库/删库/改名再显式清空。
+        # 量级 = 图库数 × 改过几次角色名，超上限按插入顺序淘汰。
+        self._trigger_cache: Dict[tuple, set] = {}
+        self._query_cache: Dict[tuple, set] = {}  # 同上，键=(消息首词, 同义词快照) → 同义词展开结果
+        # 全库统计缓存（主页角标 {图库数, 图片数}）：命中条件 = 变更代次 + 各图库目录 mtime 指纹都没变，
+        # 命中时不再全盘 scandir。mtime 指纹兜住「绕过 API 手改图库目录」的情况，代次兜住同粒度文件系统。
+        self._stats_gen = 0
+        self._stats_cache: Optional[tuple] = None
+        # 目录列举缓存（0.3.0 性能）：图库名 → (目录 st_mtime_ns, 按编号排好序的图片文件名)。
+        # 命中判据 = 目录 mtime 没变，所以 API 上传/删除 和「绕过 API 手改目录」都会自动失效；
+        # 翻页/搜索不再每页重复 scandir + 拼音/编号排序。
+        self._dir_cache: Dict[str, tuple] = {}
+        # 图库名拼音排序缓存：(galleries 目录 st_mtime_ns, 排好序的名字列表)。
+        # 建/删/改名图库都会动父目录 mtime，所以判据只看这一处；改名/删库时另外显式清空兜底。
+        self._sorted_names_cache: Optional[tuple] = None
+        # 封面主题色落盘缓存（temp/themes.json，可清、不进导出）：惰性读入内存，key → #rrggbb。
+        # 新算出来的颜色才回写；坏图/兜底色不写盘（避免把 100 个库都污染成同一个灰绿）。
+        self._theme_disk: Optional[Dict[str, str]] = None
+        self._theme_disk_dirty = False
+        self._theme_disk_lock = threading.Lock()
         # ponytail: 入库全局锁（并行上传时"算编号+写盘"必须原子，否则同名互覆）；瓶颈出现再拆图库级锁
         self._save_lock = asyncio.Lock()
+        # 移动/复制后台任务（0.3.0 选择模式重构）：同一时刻只允许一个（设计稿的 暂停/继续/取消 都只作用于当前任务），
+        # 结束态（done/cancelled/error）保留给前端读最终结果，下次 xfer_start 覆盖
+        self._xfer: Dict[str, Any] = {"state": "idle"}
+        self._xfer_lock = threading.Lock()  # start 的「查状态+置 running」与 worker 收尾互斥，防双击开出两个任务
+        # 导出全部数据（0.3.0 同版）：后台 daemon 线程把 data 根目录（除 temp/）打成一个 ZIP 放 temp/，
+        # 前端轮询 export_status + export_chunk 分块取字节。状态字段固定 state/name/size/path/error，
+        # state ∈ idle/running/done/error/cancelled；读写一律走 _export_lock。打包阶段 export_cancel
+        # 置 _export_cancel 事件，worker 遍历时逐项检查；worker 的异常只落 state=error，绝不外抛给 handler。
+        self._export: Dict[str, Any] = {"state": "idle", "name": "", "size": 0, "path": "", "error": ""}
+        self._export_lock = threading.Lock()
+        self._export_cancel = threading.Event()  # 导出取消旗：export_cancel 置位，_export_start 每轮 clear
         self._register_page_apis()
 
     # ---------------- 消息响应 ----------------
@@ -415,11 +796,12 @@ class GalleryPlus(Star):
                 yield await self._conflict_result(event, matches)
                 return
             folder = self._galleries / matches[0]
-            imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in EXTS]
+            # 取图走目录快照缓存（ Dirent scandir + mtime 判据）：别在消息循环里 iterdir 逐文件 stat
+            imgs = [folder / name for name in self._gallery_files(matches[0])]
             if not imgs:
                 logger.debug(f"关键词“{matches[0]}”图库为空")
                 return
-            count = min(requested or self._send_count(), MAX_SEND_COUNT, len(imgs))
+            count = min(requested or self._send_count(), self._runtime_settings()["max_send"], len(imgs))
             for result in await self._image_result(event, random.sample(imgs, count), query):
                 yield result
         except Exception as e:
@@ -444,7 +826,16 @@ class GalleryPlus(Star):
             threshold = min(max(int(raw.get("forward_threshold", DEFAULT_FORWARD_THRESHOLD)), 2), MAX_SEND_COUNT)
         except (TypeError, ValueError):
             threshold = DEFAULT_FORWARD_THRESHOLD
-        return {"send_count": count, "forward_threshold": threshold, "synonyms": clean}
+        try:  # 单次发送上限：缺省 10，越界/垃圾值都收敛（手改 settings.json 也不能破界）
+            max_send = min(max(int(raw.get("max_send", DEFAULT_MAX_SEND)), 1), MAX_SEND_COUNT)
+        except (TypeError, ValueError):
+            max_send = DEFAULT_MAX_SEND
+        return {
+            "send_count": count,
+            "forward_threshold": threshold,
+            "max_send": max_send,
+            "synonyms": clean,
+        }
 
     def _send_count(self) -> int:
         return self._runtime_settings()["send_count"]
@@ -460,8 +851,14 @@ class GalleryPlus(Star):
                         forms.add(text.replace(src, dst))
         return forms
 
-    def _gallery_trigger_forms(self, kw: str) -> set:
-        char = self._gallery_menu(kw)["char"].strip()
+    def _gallery_trigger_forms(self, kw: str, char: Optional[str] = None) -> set:
+        """单图库的全部触发词（关键词本身 + 角色名/去掉空格·间隔号/分词的「简称+照片/图片」）。
+
+        char 可显式传入（_match_trigger 已经取过 _gallery_menu，别重复取）；不传则现查设置。
+        """
+        if char is None:
+            char = self._gallery_menu(kw)["char"]
+        char = char.strip()
         suffix = next((x for x in ("照片", "图片") if kw.endswith(x)), "")
         if not suffix:
             return {kw}
@@ -473,26 +870,59 @@ class GalleryPlus(Star):
             bases.update(token[i:] for i in range(1, max(len(token) - 1, 1)))
         return {kw, *(base + suffix for base in bases if len(base) >= 2)}
 
+    # ---- 触发词缓存（每条消息都要遍历全部图库重算，展开含正则/集合运算，纯函数结果可缓存） ----
+    # 正确性：缓存键里已经带上了角色名与同义词快照，设置一变键就变（不会读到旧语义）；
+    # 另外任何 settings 落盘 / 建库 / 删库 / 改名都会调 _invalidate_trigger_cache 显式清空（宁多勿漏）。
+    _MATCH_CACHE_MAX = 512
+
+    def _invalidate_trigger_cache(self) -> None:
+        """settings 落盘或图库名变化后调用：触发词/查询词缓存整体作废，下次按新设置重算。"""
+        self._trigger_cache.clear()
+        self._query_cache.clear()
+
+    def _cache_put(self, cache: dict, key, value):
+        """写入有上限的缓存：超限按插入顺序淘汰最旧一条（条目量级=图库数，简单 FIFO 够用）。"""
+        if len(cache) >= self._MATCH_CACHE_MAX:
+            cache.pop(next(iter(cache)), None)
+        cache[key] = value
+        return value
+
+    def _gallery_match_forms(self, kw: str, char: str, syn_sig: tuple,
+                             synonyms: Mapping[str, List[str]]) -> set:
+        """图库侧命中集合（触发词 × 同义词展开），按 (图库, 角色名, 同义词快照) 缓存。"""
+        key = (kw, char, syn_sig)
+        hit = self._trigger_cache.get(key)
+        if hit is None:
+            forms = set()
+            for form in self._gallery_trigger_forms(kw, char):
+                forms.update(self._replace_forms(form, synonyms))
+            hit = self._cache_put(self._trigger_cache, key, forms)
+        return hit
+
     def _match_trigger(self, query: str) -> List[str]:
         synonyms = self._runtime_settings()["synonyms"]
-        query_forms = self._replace_forms(query, synonyms)
+        syn_sig = tuple((canonical, tuple(aliases)) for canonical, aliases in synonyms.items())
+        qkey = (query, syn_sig)
+        query_forms = self._query_cache.get(qkey)
+        if query_forms is None:
+            query_forms = self._cache_put(self._query_cache, qkey, self._replace_forms(query, synonyms))
         out = []
-        for d in self._galleries.iterdir():
-            if not d.is_dir():
-                continue
-            forms = set()
-            for form in self._gallery_trigger_forms(d.name):
-                forms.update(self._replace_forms(form, synonyms))
-            if query_forms & forms:
-                out.append(d.name)
+        with os.scandir(self._galleries) as it:  # Dirent.is_dir 在 Windows 免逐目录 stat（每条消息都走这里）
+            for e in it:
+                if not e.is_dir():
+                    continue
+                name = e.name
+                char = self._gallery_menu(name)["char"]
+                if query_forms & self._gallery_match_forms(name, char, syn_sig, synonyms):
+                    out.append(name)
         return sorted(out, key=pinyin_key)
 
-    @staticmethod
-    def _parse_trigger(msg: str):
+    def _parse_trigger(self, msg: str):
         parts = msg.split()
         requested = None
         if len(parts) > 1 and parts[-1].isdigit():
-            requested = min(max(int(parts.pop()), 1), MAX_SEND_COUNT)
+            # 指令尾数字是「这次要几张」，按运行设置里的单次发送上限截断
+            requested = min(max(int(parts.pop()), 1), self._runtime_settings()["max_send"])
         return "".join(parts), requested
 
     async def _image_result(self, event, paths: List[Path], label: str):
@@ -516,6 +946,21 @@ class GalleryPlus(Star):
         if path is None:
             return event.plain_result("指令冲突：" + "、".join(matches))
         return event.chain_result([Image.fromFileSystem(str(path))])
+
+    if _ON_LLM_REQUEST is not None:
+
+        @_ON_LLM_REQUEST()
+        async def prune_llm_history_images(self, event: AstrMessageEvent, req) -> None:
+            """LLM 请求前剥掉历史上下文里的旧图片（见 strip_history_images）。
+
+            只动 req.contexts（历史），不碰 req.image_urls（本次消息引用/上传的图）——
+            用户引用了图库图片时，模型本次照样看得见那张图。
+            纯内存列表操作：不落盘、不加锁、不 await，不干扰消息监听与发送。
+            """
+            try:
+                strip_history_images(getattr(req, "contexts", None))
+            except Exception as e:
+                logger.warning(f"剥离 LLM 历史图片失败（不影响本次请求）: {e}")
 
     # ---------------- 原插件指令回归（0.1.3）----------------
     # 指令走 AstrBot 命令系统，需要命令前缀（如 /收集）；关键词回图仍是裸消息触发，无需前缀。
@@ -725,7 +1170,12 @@ class GalleryPlus(Star):
             return {}
 
     def _count_send(self, kw: str, file: str) -> None:
-        """静默发送计数：图片/图库各 +1，并记 24 小时时段分布（stats.json，暂无界面）。"""
+        """静默发送计数：图片/图库各 +1，并记 24 小时时段分布（stats.json，暂无界面）。
+
+        内存即时累加，落盘走 _flush_stats 异步防抖：原来每发一张同步全量 dumps+写盘，
+        在事件循环上卡 IO（消息处理卡顿来源之一）。
+        ponytail: 防抖窗口内进程崩溃最多丢几条计数；卸载时 terminate() 会补写一次。
+        """
         hour = time.localtime().tm_hour
         for table, key in (
             (self._stats.setdefault("images", {}), f"{kw}/{file}"),
@@ -734,10 +1184,29 @@ class GalleryPlus(Star):
             row = table.setdefault(key, {"sends": 0, "hours": [0] * 24})
             row["sends"] += 1
             row["hours"][hour] += 1
+        self._stats_dirty = True
+        if self._stats_task is None or self._stats_task.done():  # 单飞：写盘期间新计数由脏标记带回
+            self._stats_task = asyncio.create_task(self._flush_stats())
+
+    async def _flush_stats(self) -> None:
+        """stats.json 防抖落盘：脏标记清零 → dumps → 线程写盘；写盘期间有新计数就再写一轮。
+
+        dumps 在事件循环上同步做（对并发 _count_send 原子，不会边遍历边改字典），
+        真正的磁盘 IO 扔线程，不堵消息循环。
+        """
         try:
-            self._save_stats()
-        except OSError:
-            pass  # ponytail: 每次发送全量落盘，bot 量级无碍；高频了再改防抖/追加日志
+            while self._stats_dirty:
+                self._stats_dirty = False
+                text = json.dumps(self._stats, ensure_ascii=False)
+                await asyncio.to_thread(self._stats_file.write_text, text, "utf-8")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"stats.json 落盘失败: {e}")
+
+    async def terminate(self):
+        """插件卸载/重载前把防抖窗口内还没落盘的发送计数补写掉。"""
+        await self._flush_stats()
 
     def _save_stats(self) -> None:
         self._stats_file.write_text(json.dumps(self._stats, ensure_ascii=False), "utf-8")
@@ -755,6 +1224,13 @@ class GalleryPlus(Star):
         if safe != kw:  # 有改动说明输入含非法字符/穿越企图
             return None
         return self._galleries / safe
+
+    def _imp_dir(self, kw: str) -> Optional[Path]:
+        """批量导入暂存图库目录（kw 为去掉前缀的正式关键词）；含非法字符返回 None。"""
+        safe = self._safe_kw(kw)
+        if safe != kw:
+            return None
+        return self._tmp / "import" / (IMP_PREFIX + safe)
 
     def _next_num(self, folder: Path, kw: str) -> int:
         """下一个可用编号 = 图库内**图片文件**的最大编号 + 1。
@@ -774,6 +1250,62 @@ class GalleryPlus(Star):
         """图库内图片的排序/编号键：规范名按编号数值排（kw-10 在 kw-2 之后），乱名按名字排在最后。"""
         m = re.fullmatch(rf"{re.escape(kw)}-(\d+)", Path(name).stem)
         return (0, int(m.group(1)), name) if m else (1, 0, name)
+
+    def _gallery_scan(self, name: str):
+        """图库目录快照：(目录 st_mtime_ns, 按 _image_key 排好序的图片文件名列表)。
+
+        命中判据 = 缓存里的 mtime_ns 与当前目录 mtime 一致：目录 mtime 只在「条目增删改名」时变，
+        所以 API 上传/删除 和「绕过 API 直接往目录里拷图/删图」都能立刻失效，不会返回过期列表。
+        目录 stat/scandir 失败返回 (None, [])（并发删库/手改坏时列表照常返回，不拖挂整个请求）。
+        """
+        d = self._galleries / name
+        try:
+            mtime_ns = d.stat().st_mtime_ns
+        except OSError:
+            self._dir_cache.pop(name, None)
+            return None, []
+        hit = self._dir_cache.get(name)
+        if hit is not None and hit[0] == mtime_ns:
+            return hit[0], hit[1]
+        try:
+            # Dirent 自带属性：别退回 iterdir()+is_file() 的逐文件 stat
+            with os.scandir(d) as it:
+                files = [e.name for e in it if e.is_file() and e.name.lower().endswith(EXTS_TUP)]
+        except OSError:
+            self._dir_cache.pop(name, None)
+            return None, []
+        files.sort(key=lambda n: self._image_key(name, n))
+        if len(self._dir_cache) > 4096:  # 防无界增长：库多到这种量级时全量重建一次比逐条淘汰便宜
+            self._dir_cache.clear()
+        self._dir_cache[name] = (mtime_ns, files)
+        return mtime_ns, files
+
+    def _gallery_files(self, name: str) -> List[str]:
+        """图库里的图片文件名（按编号排序）。返回值是缓存列表本体，调用方只读、别原地改。"""
+        return self._gallery_scan(name)[1]
+
+    def _sorted_gallery_names(self) -> List[str]:
+        """全部图库名（拼音序）。判据 = galleries 目录 mtime_ns：建/删/改名图库都会动它。
+
+        返回值是缓存列表本体，调用方只读（需要过滤就自己生成新列表）。stat 失败返回 []。
+        """
+        try:
+            mtime_ns = self._galleries.stat().st_mtime_ns
+        except OSError:
+            self._sorted_names_cache = None
+            return []
+        hit = self._sorted_names_cache
+        if hit is not None and hit[0] == mtime_ns:
+            return hit[1]
+        try:
+            names = sorted(
+                (d.name for d in self._galleries.iterdir() if d.is_dir()), key=pinyin_key
+            )
+        except OSError:
+            self._sorted_names_cache = None
+            return []
+        self._sorted_names_cache = (mtime_ns, names)
+        return names
 
     @staticmethod
     def _detect_ext(data: bytes) -> str:
@@ -799,10 +1331,19 @@ class GalleryPlus(Star):
         return stem if PID_RE.fullmatch(stem) else None
 
     def save_upload(
-        self, kw: str, filename: str, data: bytes, pid: Optional[str] = None
+        self,
+        kw: str,
+        filename: str,
+        data: bytes,
+        pid: Optional[str] = None,
+        base: Optional[Path] = None,
+        prefix: str = "",
     ) -> Path:
-        """入库：识别 pid、按 关键词-编号 重命名、记录 pid 映射。显式传入 pid 时优先（批量导入用）。"""
-        folder = self._galleries / self._safe_kw(kw)
+        """入库：识别 pid、按 关键词-编号 重命名、记录 pid 映射。显式传入 pid 时优先（批量导入用）。
+
+        base/prefix 给批量导入的暂存区用：文件夹落在 base/__导入_<kw>/，pid/统计键前缀同名。
+        """
+        folder = (base or self._galleries) / f"{prefix}{self._safe_kw(kw)}"
         folder.mkdir(parents=True, exist_ok=True)
         kw = folder.name
         ext = Path(filename).suffix.lower()
@@ -816,6 +1357,10 @@ class GalleryPlus(Star):
             n += 1
             target = folder / f"{kw}-{n}{ext}"
         target.write_bytes(data)
+        self._bump_stats_gen()  # 图库/图片数量变了（暂存区写入不动正式统计，多作废一次只为省心）
+        # 目录列举缓存显式作废：文件系统的目录 mtime 分辨率有限（Windows 上连续改动可能落同一刻），
+        # 不能只指望 mtime 判据，否则刚上传的图可能在这一拍里列不出来
+        self._dir_cache.pop(kw, None)
         if pid:
             self._pids[f"{kw}/{target.name}"] = pid
             self._save_pids()
@@ -839,14 +1384,212 @@ class GalleryPlus(Star):
                 self._stats.get("images", {}).pop(ok, None)
         for th in (self._tmp / "thumbs").glob(f"{old_gal}_{p.stem}.*.thumb.jpg"):
             th.unlink(missing_ok=True)
+        # 源/目标图库的目录快照都作废（跨库移动=两边都变；同库改名也不吃亏）。
+        # 显式作废而不只靠目录 mtime：文件系统时间戳粒度有限，连续改名可能落在同一刻度。
+        self._dir_cache.pop(p.parent.name, None)
+        self._dir_cache.pop(t.parent.name, None)
+        self._bump_stats_gen()  # 跨库移动/复制会改变两个库的图片数（同库改名只是多作废一次）
         return t
 
-    def import_files(self, pattern: str, files: List[dict]) -> dict:
+    # ---------------- 移动/复制后台任务（0.3.0 选择模式重构） ----------------
+    # 设计稿要求任务可 开始/暂停/继续/转后台/取消（取消要回退已完成的部分），所以不能像 batch 那样
+    # 在一个请求里同步做完：worker 跑在 daemon 线程里，前端轮询 xfer_status 拿进度与磁盘信息。
+
+    def _xfer_worker(self, task: Dict[str, Any], src: Path, dst: Path, names: List[str]):
+        dstkw = dst.name
+        try:
+            for name in names:
+                # 暂停 = 清掉 resume 事件；这里每 0.2s 醒一次看取消旗，取消/继续都能即时响应
+                while not task["resume"].wait(0.2) and not task["cancel"]:
+                    pass
+                if task["cancel"]:
+                    break
+                p = src / name
+                try:
+                    sz = p.stat().st_size
+                except OSError:
+                    task["failed"].append(name)
+                    task["done"] += 1
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    target = dst / f"{dstkw}-{self._next_num(dst, dstkw)}{p.suffix}"
+                    self._rename_image(p, target, src.name, keep_src_meta=task["op"] == "copy")
+                except OSError:
+                    task["failed"].append(name)
+                else:
+                    if task["op"] == "copy":
+                        task["bytes_r"] += sz  # 复制：读源 + 写目标各算一遍
+                        task["bytes_w"] += sz
+                    else:
+                        task["bytes_w"] += sz  # 移动：同卷是改名（无真实 IO），跨卷按落盘大小计
+                    task["ops"] += 1
+                    task["op_ms"] += (time.perf_counter() - t0) * 1000.0
+                    task["log"].append((name, target.name))
+                task["done"] += 1
+            if task["cancel"]:
+                # 取消要回退：复制=删掉已生成的目标文件（含 pid/统计/缩略图），移动=原样搬回去
+                task["state"] = "rolling"
+                task["rb_total"] = len(task["log"])
+                task["rb_done"] = 0
+                for srcname, dstname in reversed(task["log"]):
+                    try:
+                        if task["op"] == "copy":
+                            self.delete_image(dstkw, dstname)
+                            self._stats.get("images", {}).pop(f"{dstkw}/{dstname}", None)
+                        elif (dst / dstname).is_file():
+                            self._rename_image(dst / dstname, src / srcname, dstkw)
+                    except OSError as e:
+                        logger.warning(f"图库plus 任务回退失败（{task['op']} {dstname}）: {e}")
+                    task["rb_done"] += 1
+                self._save_pids()
+                try:
+                    self._save_stats()
+                except OSError:
+                    pass
+                task["state"] = "cancelled"
+            else:
+                self._save_pids()
+                try:
+                    self._save_stats()
+                except OSError:
+                    pass
+                task["state"] = "done"
+        except Exception as e:  # worker 不许静默死：状态给前端展示
+            task["state"] = "error"
+            task["error"] = str(e)
+            logger.error(f"图库plus 移动/复制任务失败: {e}", exc_info=True)
+
+    # ---------------- 导出全部数据（ZIP：后台线程打包 + 分块读取） ----------------
+    # 数据可能上百 MB，不能一个请求走 bridge（base64 还要再胀 4/3），所以：
+    # export_data 起 daemon 线程 → export_status 轮询 state → export_chunk 按 offset/size 取 base64 块。
+    # 打包阶段可 export_cancel 取消（worker 逐项检查事件，删半成品）；下载阶段取消由前端本地停、zip 保留。
+    # ZIP_STORED：图片本身已压缩，再 deflate 只白烧 CPU。
+
+    _EXPORT_KEYS = ("state", "name", "size", "path", "error")
+
+    def _export_snapshot(self) -> dict:
+        """导出状态副本（所有 action 只经这里读，字段与前端契约一致）。"""
+        with self._export_lock:
+            return {k: self._export.get(k) for k in self._EXPORT_KEYS}
+
+    def _export_update(self, **kw) -> None:
+        with self._export_lock:
+            self._export.update(kw)
+
+    def _export_start(self) -> dict:
+        """启动打包；已在 running 就回当前状态；上一份 zip 先删掉再开新的。
+
+        每轮开始先 clear 取消旗：上一轮 cancelled/error/done 都能正常重新开始。
+        """
+        with self._export_lock:
+            if self._export.get("state") == "running":
+                return {k: self._export.get(k) for k in self._EXPORT_KEYS}
+            self._export_cancel.clear()  # 新一轮导出：清掉上一轮残留的取消旗
+            prev = str(self._export.get("path") or "")
+            name = f"图库plus_数据导出_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+            target = self._tmp / name
+            self._export = {"state": "running", "name": name, "size": 0, "path": str(target), "error": ""}
+        for old in (prev, str(target)):  # 旧 zip 先删（名字按秒，上一份可能正好同名）
+            if not old:
+                continue
+            try:
+                Path(old).unlink(missing_ok=True)
+            except OSError:
+                pass
+        threading.Thread(target=self._export_worker, args=(target,), daemon=True).start()
+        return self._export_snapshot()
+
+    def _export_worker(self, target: Path) -> None:
+        """把 data 根目录下除 temp/ 外的全部内容打进 ZIP；失败置 error 并删半成品，绝不外抛。
+
+        遍历时逐项检查取消旗（顶层条目/每个目录/每个文件前后），12k 张图也能秒级响应；
+        取消 → 正常关闭 ZIP → 删半成品 → state=cancelled（error 置空），绝不落 done。
+        """
+        cancelled = False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for entry in sorted(self._root.iterdir(), key=lambda p: p.name):
+                    if self._export_cancel.is_set():
+                        cancelled = True
+                        break
+                    if entry == self._tmp or not entry.exists():  # temp/（含本 zip 自身与缩略图缓存）不导出
+                        continue
+                    if entry.is_file():
+                        zf.write(entry, entry.name, compress_type=zipfile.ZIP_STORED)
+                        if self._export_cancel.is_set():
+                            cancelled = True
+                            break
+                        continue
+                    if not entry.is_dir():
+                        continue
+                    zf.writestr(entry.name + "/", b"")  # 目录条目：空目录也能从 ZIP 里看出结构
+                    for dirpath, dirnames, filenames in os.walk(entry):
+                        if self._export_cancel.is_set():
+                            cancelled = True
+                            break
+                        dirnames.sort()
+                        for dn in dirnames:
+                            if self._export_cancel.is_set():
+                                cancelled = True
+                                break
+                            rel = (Path(dirpath) / dn).relative_to(self._root).as_posix()
+                            zf.writestr(rel + "/", b"")
+                        if cancelled:
+                            break
+                        for fn in sorted(filenames):
+                            if self._export_cancel.is_set():
+                                cancelled = True
+                                break
+                            p = Path(dirpath) / fn
+                            if not p.is_file():  # 遍历期间被删掉的文件：跳过，不让整包失败
+                                continue
+                            zf.write(p, p.relative_to(self._root).as_posix(),
+                                     compress_type=zipfile.ZIP_STORED)
+                            if self._export_cancel.is_set():
+                                cancelled = True
+                                break
+                        if cancelled:
+                            break
+                    if cancelled:
+                        break
+            if not cancelled:  # 正常收尾：先量大小，再在锁内「查取消旗 + 落 done」一步完成
+                try:
+                    size = target.stat().st_size
+                except OSError as e:
+                    self._export_update(state="error", size=0, error=f"导出文件写入失败：{e}")
+                    return
+                with self._export_lock:
+                    if not self._export_cancel.is_set():
+                        self._export.update(state="done", size=size, error="")
+                        return
+                cancelled = True  # 恰好在收尾时收到取消：按取消处理，绝不落 done
+        except Exception as e:  # 打包失败：清半成品 + 状态给前端展示
+            logger.warning(f"图库plus 数据导出失败: {e}")
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._export_update(state="error", size=0, error=f"导出失败：{e}")
+            return
+        try:  # 只在「用户取消」路径走到这里：删半成品 + 置 cancelled
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._export_update(state="cancelled", size=0, error="")
+
+
+    def import_files(self, pattern: str, files: List[dict], stage: bool = False) -> dict:
         """批量导入：按搭积木式文件名格式解析，自动分库到对应关键词。
 
         不符合格式/格式不支持的文件不猜、直接跳过并在结果里说明原因。
+        stage=True 时先进暂存区（temp/import/__导入_<kw>/，验收页确认后才并入正式图库），
+        返回里的 gallery 仍是正式关键词（前端按它汇总新增图库）。
         """
         rx, has_ext = build_filename_regex(pattern)
+        base = (self._tmp / "import") if stage else None
+        prefix = IMP_PREFIX if stage else ""
         imported: List[dict] = []
         skipped: List[dict] = []
         for f in files or []:
@@ -873,9 +1616,9 @@ class GalleryPlus(Star):
                 skipped.append({"name": name, "reason": "内容为空"})
                 continue
             kw = self._safe_kw(m.group("kw"))
-            p = self.save_upload(kw, name, data, pid=m.groupdict().get("pid"))
+            p = self.save_upload(kw, name, data, pid=m.groupdict().get("pid"), base=base, prefix=prefix)
             imported.append(
-                {"file": p.name, "gallery": kw, "pid": self._pids.get(f"{kw}/{p.name}")}
+                {"file": p.name, "gallery": kw, "pid": self._pids.get(f"{p.parent.name}/{p.name}")}
             )
         return {"ok": True, "imported": imported, "skipped": skipped}
 
@@ -887,10 +1630,12 @@ class GalleryPlus(Star):
         if not p.is_file():
             return False
         p.unlink()
+        self._dir_cache.pop(d.name, None)  # 目录列举缓存显式作废（不指望目录 mtime 一定跨刻度）
         for t in (self._tmp / "thumbs").glob(f"{d.name}_{p.stem}.*.thumb.jpg"):
             t.unlink(missing_ok=True)  # 各档尺寸的缓存一起清（. 后接尺寸，不会误伤同前缀文件名）
         self._pids.pop(f"{d.name}/{name}", None)
         self._save_pids()
+        self._bump_stats_gen()  # 图片数 -1
         return True
 
     def delete_gallery(self, kw: str) -> bool:
@@ -898,6 +1643,10 @@ class GalleryPlus(Star):
         if not d or not d.is_dir():
             return False
         shutil.rmtree(d)
+        self._bump_stats_gen()     # 图库数/图片数变了
+        self._invalidate_trigger_cache()  # 库没了：旧触发词/角色名不能再命中
+        self._dir_cache.pop(d.name, None)  # 目录快照作废（同名重建时不能拿旧列表）
+        self._sorted_names_cache = None    # 名字列表立刻更新，不等文件系统 mtime 粒度
         for t in (self._tmp / "thumbs").glob(f"{d.name}_*.thumb.jpg"):
             t.unlink(missing_ok=True)
         for key in [k for k in self._pids if k.startswith(f"{d.name}/")]:
@@ -910,67 +1659,139 @@ class GalleryPlus(Star):
         return True
 
     def list_galleries(self) -> List[dict]:
+        """旧版 GET 列表（全量、带图片）。目录列举/拼音排序都走缓存，别每页重扫重排。"""
         out: List[dict] = []
-        for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
-            if not d.is_dir():
-                continue
-            names = sorted(
-                (p.name for p in d.iterdir()
-                 if p.is_file() and p.suffix.lower() in EXTS),
-                key=lambda n: self._image_key(d.name, n),  # 按编号数值排，kw-10 不排到 kw-2 前面
-            )
+        for name in self._sorted_gallery_names():
+            d = self._galleries / name
+            mtime_ns, names = self._gallery_scan(name)
             out.append(
                 {
-                    "name": d.name,
+                    "name": name,
                     "count": len(names),
-                    "wm": self._gallery_wm(d.name),
-                    "tag": self._tag_of(d.name),
-                    "cover": _stable_cover(d.name, d, names),
+                    "wm": self._gallery_wm(name),
+                    "tag": self._tag_of(name),
+                    "cover": _stable_cover(
+                        name, d, names, None if mtime_ns is None else mtime_ns / 1e9
+                    ),
                     "images": [
-                        {"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in names
+                        {"file": n, "pid": self._pids.get(f"{name}/{n}")} for n in names
                     ],
                 }
             )
         return out
 
-    def list_gallery_names(self, offset: int = 0, limit: Optional[int] = None):
-        """分页列出图库（名称、张数、水印开关、随机封面），供 WebUI 懒加载。返回 (页数据, 总数)。"""
-        names = sorted((d.name for d in self._galleries.iterdir() if d.is_dir()), key=pinyin_key)
+    def list_gallery_names(self, offset: int = 0, limit: Optional[int] = None, q: str = ""):
+        """分页列出图库（名称/张数/水印开关/随机封面 + 角色名/年份/主题色），供 WebUI 懒加载。
+
+        q：不区分大小写的子串搜索，命中「图库名（=图库指令）/ 角色名 / 标签名」任一即保留。
+        角色名取 _gallery_menu 的 char（缺省=图库名），标签名走 _tag_table + 图库→标签映射
+        （标签已被删/指向不存在的 id → 视为无标签，不参与匹配）。过滤发生在分页前，返回的
+        总数是过滤后的数量；stats（主页角标）始终是全量统计，与 q 无关。
+        返回 (页数据, 过滤后总数)。
+        """
+        q = (q or "").strip().lower()
+        # 拼音排序结果按 galleries 目录 mtime 缓存：翻页/搜索不再每页全量列举 + 重排
+        names = self._sorted_gallery_names()
+        if q:
+            def hit(name: str) -> bool:  # 每库几次 dict 查（这三个都只读 settings，不碰盘）
+                if q in name.lower():
+                    return True
+                if q in self._gallery_menu(name)["char"].lower():  # 角色名，缺省=图库名
+                    return True
+                tag = self._tag_of(name)  # 标签不存在 → None → 不匹配
+                return bool(tag) and q in tag["name"].lower()
+
+            names = [name for name in names if hit(name)]
         page = names if limit is None else names[offset : offset + limit]
         out = []
         for name in page:
             d = self._galleries / name
-            files = [
-                p.name for p in d.iterdir()
-                if p.is_file() and p.suffix.lower() in EXTS
-            ]
-            files.sort(key=lambda n: self._image_key(name, n))
+            mtime_ns, files = self._gallery_scan(name)  # 目录快照走缓存；mtime 顺手喂给封面种子
+            files_mtime = None if mtime_ns is None else mtime_ns / 1e9
+            menu = self._gallery_menu(name)
+            cover = _stable_cover(name, d, files, files_mtime)
             out.append(
                 {
                     "name": name,
                     "count": len(files),
                     "wm": self._gallery_wm(name),
                     "tag": self._tag_of(name),
-                    "cover": _stable_cover(name, d, files),
+                    "cover": cover,
+                    "char": menu["char"],                 # 角色名（缺省=图库名），主页卡片标题用
+                    "years": self._year_text(menu),       # "2020-2025" / "2024.01~2025.02"，没设 None
+                    "theme": self._cover_theme(name, cover),  # 封面的主色，与发送水印方块同一算法
                 }
             )
         return out, len(names)
+
+    def _bump_stats_gen(self) -> None:
+        """图库/图片数量可能变了：自增变更代次，让 _gallery_stats 缓存作废（下次按需重扫）。"""
+        self._stats_gen += 1
+
+    def _stats_signature(self):
+        """统计缓存的命中指纹：变更代次 + 图库区目录 mtime + 每个图库目录 mtime。
+
+        目录 mtime 覆盖「不走 API、直接往 galleries/ 里拷图/删图」的手改场景；变更代次覆盖
+        API 侧的上传/删除/建库/删库/改名/导入（即使文件系统 mtime 粒度粗也能失效）。
+        Windows Dirent 自带 stat 数据，这里只是一次目录列举 + 每库一次 stat，不数文件。
+        拿不到（目录被并发删掉）时返回 None → 不缓存。
+        """
+        parts: List[tuple] = [self._stats_gen]
+        try:
+            with os.scandir(self._galleries) as it:
+                for e in it:
+                    if e.is_dir():
+                        try:
+                            parts.append((e.name, e.stat().st_mtime_ns))
+                        except OSError:
+                            parts.append((e.name, None))
+        except OSError:
+            return None
+        return tuple(parts)
+
+    def _gallery_stats(self) -> Dict[str, int]:
+        """全库统计 {图库数, 图片数}，供主页角标；一次 scandir 扫全库（写法同 _menu_stats）。
+
+        结果按 _stats_signature() 缓存：目录内容没变（含手改）直接返回，不再全盘 scandir。
+        """
+        sig = self._stats_signature()
+        if sig is not None and self._stats_cache is not None and self._stats_cache[0] == sig:
+            return dict(self._stats_cache[1])
+        galleries = images = 0
+        try:
+            for d in self._galleries.iterdir():
+                if not d.is_dir():
+                    continue
+                galleries += 1
+                with os.scandir(d) as it:
+                    images += sum(
+                        1 for e in it if e.is_file() and e.name.lower().endswith(EXTS_TUP)
+                    )
+        except OSError:  # 库目录被并发删掉/手改坏：返回已统计到的部分，别把整个列表拖挂
+            pass
+        result = {"galleries": galleries, "images": images}
+        if sig is not None:
+            self._stats_cache = (sig, result)
+        return dict(result)
+
+    def _list_gallery_page(self, offset: int, limit: Optional[int], q: str):
+        """list_galleries action 的同步半身：列表（取主题色要读盘解码）+ 全库统计一起丢线程池。"""
+        page, total = self.list_gallery_names(offset, limit, q)
+        stats = self._gallery_stats()
+        self._save_theme_disk()  # 本次新算出来的封面主色一次落盘（这里已在工作线程，别每张图写一遍）
+        return page, total, stats
 
     def list_images(self, kw: str, offset: int = 0, limit: Optional[int] = None):
         """分页列出某图库的图片（文件名+pid），供 WebUI 懒加载。返回 (页数据, 总数)。"""
         d = self._kw_dir(kw)
         if not d or not d.is_dir():
             return [], 0
-        names = sorted(
-            (p.name for p in d.iterdir()
-             if p.is_file() and p.suffix.lower() in EXTS),
-            key=lambda n: self._image_key(d.name, n),  # 按编号数值排（kw-10 在 kw-2 之后）
-        )
+        names = self._gallery_files(d.name)  # 目录快照走缓存（判据=目录 mtime），别每次重扫重排
         page = names if limit is None else names[offset : offset + limit]
         return (
             [{"file": n, "pid": self._pids.get(f"{d.name}/{n}")} for n in page],
             len(names),
-            self._settings.get("thumb_cols", 7),  # 顺带带回每行张数偏好，二级页开页即用
+            self._settings.get("thumb_cols", 4),  # 顺带带回每行张数偏好（缺省 4 张，二级页设计稿），开页即用
         )
 
     # ---------------- 水印 ----------------
@@ -986,6 +1807,8 @@ class GalleryPlus(Star):
         self._settings_file.write_text(
             json.dumps(self._settings, ensure_ascii=False, indent=2), "utf-8"
         )
+        # settings 是角色名/同义词/水印/标签的唯一来源：任何落盘都让触发词缓存作废（宁多勿漏）
+        self._invalidate_trigger_cache()
 
     def _gallery_wm(self, kw: str) -> bool:
         """单图库水印开关：settings.json 里的 gallery_wm 表，缺省开。"""
@@ -1006,9 +1829,14 @@ class GalleryPlus(Star):
 
     @staticmethod
     def _theme_color(im):
-        """图片主色：量化聚类后取 数量×饱和度 最高的中间调簇，压暗成样图那种低饱和调。"""
+        """图片主色：量化聚类后取 数量×饱和度 最高的中间调簇，压暗成样图那种低饱和调。
+
+        聚类只需要 96px 的色块分布（原 240px 档：解 20 张封面要 240ms+，96px 少一半解码量）；
+        阈值/压暗系数都没动，所以纯色图的取色结果与旧实现一致（红线用例仍是 #bf0000）。
+        """
         try:
-            t = im.convert("RGB").resize((120, 120))
+            im.draft("RGB", (96, 96))  # JPEG 只解码到 96px 档，聚类用不上更高清；非 JPEG 自然 no-op
+            t = im.convert("RGB").resize((96, 96))
             q = t.quantize(16).convert("RGB")
             cnt = Counter(q.get_flattened_data() if hasattr(q, "get_flattened_data") else q.getdata())
             sat = lambda c: max(c) - min(c)  # noqa: E731
@@ -1022,6 +1850,88 @@ class GalleryPlus(Star):
             return tuple(int(v * 0.75) for v in c)
         except Exception:
             return WM_FALLBACK_COLOR
+
+    # ---- 封面主题色落盘缓存（temp/themes.json） ----
+    # 冷启动首屏要解 20 张封面（20×~6ms），插件重启后又是一次冷启动；算过的颜色落盘，
+    # 下次进程直接读回。文件放 temp/（可清、不进导出），写盘用临时文件 + os.replace 原子替换。
+
+    def _theme_disk_load(self) -> Dict[str, str]:
+        """惰性读入 themes.json；坏文件/非 dict 一律当空表（缓存丢了只是慢一点，不能报错）。"""
+        try:
+            data = json.loads((self._tmp / "themes.json").read_text("utf-8"))
+        except Exception:
+            return {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+    def _theme_disk_get(self, key: str) -> Optional[str]:
+        with self._theme_disk_lock:
+            if self._theme_disk is None:
+                self._theme_disk = self._theme_disk_load()
+            val = self._theme_disk.get(key)
+        # 手改坏的缓存值不当命中：宁可重解码一次，也不能把垃圾颜色画到卡片上
+        return val if isinstance(val, str) and _HEX_RE.fullmatch(val) else None
+
+    def _theme_disk_put(self, key: str, value: str) -> None:
+        with self._theme_disk_lock:
+            if self._theme_disk is None:
+                self._theme_disk = self._theme_disk_load()
+            self._theme_disk[key] = value
+            self._theme_disk_dirty = True
+
+    def _save_theme_disk(self) -> None:
+        """把本次新增的条目落盘：条目 >4096 按插入顺序丢最旧；失败只丢缓存，不影响列表。"""
+        with self._theme_disk_lock:
+            if not self._theme_disk_dirty or self._theme_disk is None:
+                return
+            data = self._theme_disk
+            while len(data) > THEME_CACHE_MAX:
+                data.pop(next(iter(data)), None)
+            tmp = self._tmp / "themes.json.tmp"
+            try:
+                tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+                os.replace(tmp, self._tmp / "themes.json")  # 原子替换：读到的永远是完整 JSON
+            except OSError:  # 磁盘满/被占用：留着内存缓存，下次列表再试，别让列表请求失败
+                tmp.unlink(missing_ok=True)
+                return
+            self._theme_disk_dirty = False
+
+    def _cover_theme(self, kw: str, cover: Optional[str]) -> str:
+        """封面主色的 hex（与水印方块同一算法）；无封面/坏图回退 WM_FALLBACK_COLOR。
+
+        三级缓存：内存 (图库, 封面文件名, 封面 mtime) → 磁盘 themes.json（同一键的字符串形式）
+        → 现解码。换封面自然换键，mtime 变（同名重生成）也会换键；失败也缓存兜底色，坏图不会
+        每次重试解码。磁盘只在「真的算出颜色」时回写：坏图/兜底色写进去会把缓存污染成灰绿。
+        """
+        if not cover:
+            return _hex_color(WM_FALLBACK_COLOR)
+        p = self._galleries / kw / cover
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            return _hex_color(WM_FALLBACK_COLOR)
+        key = (kw, cover, mtime)
+        hit = self._theme_cache.get(key)
+        if hit is not None:
+            return hit
+        disk_key = f"{kw}\x1f{cover}\x1f{int(mtime)}"
+        hit = self._theme_disk_get(disk_key)  # 上一进程算过的直接回填内存，省一次解码
+        if hit is not None:
+            self._theme_cache[key] = hit
+            return hit
+        try:
+            from PIL import Image
+
+            with Image.open(p) as im:
+                color = self._theme_color(im)  # 内部按 96px 档解码聚类
+        except Exception:  # 无 PIL / 坏图：缓存兜底色，避免每次列表都重试
+            hit = _hex_color(WM_FALLBACK_COLOR)
+            self._theme_cache[key] = hit
+            return hit
+        hit = _hex_color(color)
+        self._theme_cache[key] = hit
+        if tuple(color) != WM_FALLBACK_COLOR:  # 兜底色不写盘，避免污染
+            self._theme_disk_put(disk_key, hit)
+        return hit
 
     @staticmethod
     def _load_segno():
@@ -1045,14 +1955,21 @@ class GalleryPlus(Star):
         """pixiv 作品页二维码（内嵌 segno，BSD-3-Clause，见 _segno/LICENSE）。
 
         pid 形如 95026140_p3 时取数字主体作 URL；生成失败返回 None（信息条照常，无码）。
+        相同 (作品号, px) 复用缓存里的图（返回值只读：调用方只 paste/resize，共享安全）。
         """
         from PIL import Image, ImageDraw
 
+        m = re.match(r"\d+", pid)
+        url_pid = m.group() if m else pid
+        key = (url_pid, px)
+        with _QR_CACHE_LOCK:
+            hit = _QR_CACHE.get(key)
+        if hit is not None:
+            return hit
         try:
             segno = GalleryPlus._load_segno()
 
-            m = re.match(r"\d+", pid)
-            qr = segno.make_qr(WM_QR_URL.format(pid=m.group() if m else pid), error="m")
+            qr = segno.make_qr(WM_QR_URL.format(pid=url_pid), error="m")
             matrix = qr.matrix
             n = len(matrix)
             s = 8  # 先放大渲染再 NEAREST 收缩到目标像素，避免模块缝隙
@@ -1062,10 +1979,15 @@ class GalleryPlus(Star):
                 for x, v in enumerate(row):
                     if v:
                         d.rectangle((x * s, y * s, (x + 1) * s - 1, (y + 1) * s - 1), fill=0)
-            return img.resize((px, px), Image.NEAREST)
+            img = img.resize((px, px), Image.NEAREST)
         except Exception as e:
             logger.warning(f"二维码生成失败（信息条不含码）: {e}")
             return None
+        with _QR_CACHE_LOCK:
+            if len(_QR_CACHE) >= _QR_CACHE_MAX:  # FIFO：条目量级=发送过的作品数，淘汰最旧的
+                _QR_CACHE.pop(next(iter(_QR_CACHE)), None)
+            _QR_CACHE[key] = img
+        return img
 
     @staticmethod
     def _script_runs(text: str):
@@ -1295,7 +2217,7 @@ class GalleryPlus(Star):
             return None
         color = str(row.get("color") or "")
         return {"id": tid, "name": str(row["name"]),
-                "color": color if color in TAG_COLORS else TAG_COLORS[0]}
+                "color": _tag_color(color, TAG_COLORS[0])}
 
     def _menu_config(self) -> Dict[str, Any]:
         """菜单文字 + 各部件字体（中/英/日三槽）/字号（缺项回落默认值）。"""
@@ -1359,10 +2281,12 @@ class GalleryPlus(Star):
         for d in self._galleries.iterdir():
             if not d.is_dir():
                 continue
-            for p in d.iterdir():
-                if p.is_file() and p.suffix.lower() in EXTS:
-                    total += 1
-                    newest = max(newest, p.stat().st_mtime)
+            with os.scandir(d) as it:
+                for e in it:
+                    # scandir 的 stat 走 Dirent 缓存（Windows 零系统调用），比 Path.stat 快一个量级
+                    if e.is_file() and e.name.lower().endswith(EXTS_TUP):
+                        total += 1
+                        newest = max(newest, e.stat().st_mtime)
         return total, newest
 
     @staticmethod
@@ -1610,8 +2534,13 @@ class GalleryPlus(Star):
         """生成（带磁盘缓存）最长边 px 的缩略图，返回路径；非法路径或 PIL 失败返回 None。
 
         主页封面要高清（前端 size=640），图库内网格用 240，各档各留一份缓存。
+        带暂存前缀的 kw（批量导入验收页封面）解析到 temp/import/。
         """
-        d = self._kw_dir(kw)
+        d = (
+            self._imp_dir(kw[len(IMP_PREFIX):])
+            if kw.startswith(IMP_PREFIX)
+            else self._kw_dir(kw)
+        )
         if not d or Path(image).name != image:
             return None
         p = d / image
@@ -1629,11 +2558,36 @@ class GalleryPlus(Star):
         try:
             from PIL import Image
             im = Image.open(p)
+            # JPEG 先让解码器按 1/2、1/4… 抽到 ≥px 的档再缩放：PIL 保证结果仍 ≥ 请求尺寸，
+            # 缩略图观感不变，冷生成少解一半以上像素（非 JPEG 自然 no-op）
+            im.draft("RGB", (px, px))
             im.thumbnail((px, px))
             if im.mode not in ("RGB", "L"):
                 im = im.convert("RGB")
-            im.save(out, "JPEG", quality=80)
-            return out
+            # 原子替换：thumb action 已丢进线程池，同一张缩略图可能被两个线程同时生成。直接写最终路径时
+            # 对方可能读到半截 JPEG；更糟的是半成品的 mtime 比源图新，之后会被当成合法缓存永久命中。
+            # 临时名带 pid/线程号/uuid：并发写互不干扰，成功后 os.replace 原子换名。
+            tmp = tdir / (
+                f"{out.name}.{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}.tmp"
+            )
+            try:
+                im.save(tmp, "JPEG", quality=80)  # 临时名是 .tmp，必须显式给 format
+                with _THUMB_WRITE_LOCK:  # 换名互斥：Windows 并发 replace 同一目标会偶发 WinError 5
+                    os.replace(tmp, out)
+                return out
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                # 同一档可能已被别的线程写好（本次换名撞车/被外部程序短暂占用）：直接复用那份完整缓存，
+                # 不要因为并发而让这张图退回原图；万一落盘的是半成品，mtime 判据下次会把它挡掉并重生成。
+                try:
+                    if out.is_file() and out.stat().st_mtime >= p.stat().st_mtime:
+                        return out
+                except OSError:
+                    pass
+                return None
         except Exception:
             return None  # ponytail: 无 PIL/坏图时前端退回 raw 原图
 
@@ -1705,39 +2659,91 @@ class GalleryPlus(Star):
         payload = await request.json(default={})
         action = payload.get("action")
 
-        if action == "list_galleries":  # 分页：图库名+张数，不含图片（WebUI 懒加载）
+        if action == "list_galleries":  # 分页：图库名+张数+卡片字段，不含图片（WebUI 懒加载）
             off, lim = self._page(payload)
-            page, total = self.list_gallery_names(off, lim)
-            return json_response({"galleries": page, "total": total})
+            # 主题色要解码封面、stats 要扫全库：同步磁盘 I/O 全丢线程池，别堵 Pages 的单事件循环
+            page, total, stats = await asyncio.to_thread(
+                self._list_gallery_page, off, lim, str(payload.get("q") or "")
+            )
+            return json_response({"galleries": page, "total": total, "stats": stats})
 
         if action == "list_images":  # 分页：单图库内图片列表
             kw = str(payload.get("name", ""))
             if not self._kw_dir(kw):
                 return error_response("关键词不存在或非法", status_code=400)
             off, lim = self._page(payload)
-            imgs, total, cols = self.list_images(kw, off, lim)
+            # 列举/排序虽走缓存，首次仍要 scandir：同步磁盘 IO 进线程池，别堵事件循环
+            imgs, total, cols = await asyncio.to_thread(self.list_images, kw, off, lim)
             return json_response({"images": imgs, "total": total, "cols": cols})
 
         if action == "thumb":  # 缩略图（服务端生成缓存，避免整图 base64 过桥）；size 可选
-            t = self._thumb(
-                str(payload.get("name", "")),
-                str(payload.get("image", "")),
-                payload.get("size") or 240,
-            )
-            if t is None:
+            def _thumb_src():
+                # 读文件 + base64 体积可能几十 KB：整体进线程池，别在事件循环里做同步 IO
+                t = self._thumb(
+                    str(payload.get("name", "")),
+                    str(payload.get("image", "")),
+                    payload.get("size") or 240,
+                )
+                return None if t is None else base64.b64encode(t.read_bytes()).decode()
+
+            b64 = await asyncio.to_thread(_thumb_src)
+            if b64 is None:
                 return error_response("缩略图生成失败", status_code=404)
-            b64 = base64.b64encode(t.read_bytes()).decode()
             # 键名必须是 src：bridge 会把顶层 data 键当信封剥掉（PluginPagePage.vue 的
             # response.data?.data ?? response.data），用 data 键页面只会收到裸字符串
             return json_response({"src": f"data:image/jpeg;base64,{b64}"})
 
-        if action == "create":
+        if action == "create":  # 新建图库。可选初始属性（主页「创建新图库」弹窗一次提交）；
+            # 只带 name 的旧调用完全等价于旧版：不写任何设置、只 mkdir + 返回 {ok,name}
             name = str(payload.get("name", ""))
             if not name.strip():
                 return error_response("关键词不能为空")
             kw = self._safe_kw(name)
+            _s = lambda v: None if v is None else str(v)  # noqa: E731  JSON 里可能来数字 2024
+            # 年份只在存在的键上校验：缺键=None（保留原值/未设置），空串合法=未设置。
+            # 顺序很关键：年份与标签校验都在 mkdir 之前，非法请求绝不能留下半成品目录。
+            try:
+                y0 = self._norm_year(_s(payload.get("y_start")), False) if "y_start" in payload else None
+                y1 = self._norm_year(_s(payload.get("y_end")), False) if "y_end" in payload else None
+            except ValueError as e:
+                return error_response(str(e), status_code=400)
+            if bool(y0) != bool(y1):  # 新库没有旧年份可保留：单边一律拒绝
+                return error_response("起始与结束年份要一起填（或一起留空）", status_code=400)
+            if y0 and y1 and y0 > y1:
+                return error_response("起始年份不能晚于结束年份", status_code=400)
+            tag = str(payload.get("tag") or "")  # 标签 id；空串/缺省=不打标
+            if tag and tag not in self._tag_table():
+                return error_response("标签不存在", status_code=404)
+            existed = (self._galleries / kw).exists()  # 同名已存在 = 旧版语义（幂等 no-op）
             (self._galleries / kw).mkdir(parents=True, exist_ok=True)
-            return json_response({"ok": True, "name": kw})
+            if not existed:  # 新建：只有新建的库才写初始属性（重复建同名库不能悄悄改掉现有库的设置）
+                self._bump_stats_gen()          # 图库数 +1
+                self._invalidate_trigger_cache()  # 新库的触发词按需重算，旧缓存一并作废
+                self._dir_cache.pop(kw, None)      # 同名旧库刚被删/手删过时可能留了旧快照
+                self._sorted_names_cache = None    # 新库名立刻参与拼音排序（文件系统 mtime 粒度粗时兜底）
+                if "wm" in payload:  # 有该键才写；旧调用不带 wm 就不动水印设置
+                    self.set_gallery_wm(kw, bool(payload.get("wm")))
+                if any(k in payload for k in ("char", "show", "y_start", "y_end")):
+                    # 复用 set_gallery_menu：本弹窗只有年精度，所以 y_month 固定 False
+                    self.set_gallery_menu(
+                        kw, bool(payload.get("show", True)), str(payload.get("char", "")),
+                        "个人", y0, y1, False,
+                    )
+                if tag:
+                    self._gallery_tags()[kw] = tag
+                    self._save_settings()
+            menu = self._gallery_menu(kw)
+            return json_response(
+                {
+                    "ok": True,
+                    "existed": existed,  # 同名已存在：前端据此不重复插卡/加统计（语义仍是幂等 no-op）
+                    "name": kw,
+                    "wm": self._gallery_wm(kw),
+                    "tag": self._tag_of(kw),          # {id,name,color} 或 None
+                    "menu": menu,
+                    "years": self._year_text(menu),   # "2024-2025" 或 None
+                }
+            )
 
         if action == "delete":
             if not self.delete_gallery(str(payload.get("name", ""))):
@@ -1782,17 +2788,104 @@ class GalleryPlus(Star):
             p = d / image
             if not d.is_dir() or not p.is_file():
                 return error_response("图片不存在", status_code=404)
-            b64 = base64.b64encode(p.read_bytes()).decode()
-            return json_response(
-                {"src": f"data:{MIME.get(p.suffix.lower(), 'application/octet-stream')};base64,{b64}"}
-            )
 
-        if action == "import":
+            def _raw_src() -> str:
+                # 原图可能几 MB：read_bytes + base64 一起进线程池，别让事件循环等磁盘
+                return (
+                    f"data:{MIME.get(p.suffix.lower(), 'application/octet-stream')};base64,"
+                    f"{base64.b64encode(p.read_bytes()).decode()}"
+                )
+
+            return json_response({"src": await asyncio.to_thread(_raw_src)})
+
+        if action == "import":  # stage=true → 入暂存区（验收页流），「返回」时才 import_finish 并入正式图库
             pattern = str(payload.get("pattern", "")).strip()
             if "{图库名}" not in pattern:
                 return error_response("文件名格式必须包含 {图库名}")
+            async with self._save_lock:  # 磁盘 IO 扔线程池，别堵事件循环
+                return json_response(
+                    await asyncio.to_thread(
+                        self.import_files, pattern, payload.get("files", []), bool(payload.get("stage"))
+                    )
+                )
+
+        if action == "import_list":  # 验收页：暂存图库一览（正式关键词名 + 暂存名 + 张数 + 封面）
+            def _imp_collect() -> List[dict]:
+                root = self._tmp / "import"
+                out: List[dict] = []
+                if root.is_dir():
+                    for d in root.iterdir():
+                        if not d.is_dir() or not d.name.startswith(IMP_PREFIX):
+                            continue
+                        with os.scandir(d) as it:
+                            fs = [e.name for e in it if e.is_file() and e.name.lower().endswith(EXTS_TUP)]
+                        if not fs:
+                            continue
+                        fs.sort(key=lambda n: self._image_key(d.name, n))
+                        out.append({"name": d.name[len(IMP_PREFIX):], "raw": d.name,
+                                    "count": len(fs), "cover": fs[0]})
+                out.sort(key=lambda g: pinyin_key(g["name"]))
+                return out
+
+            return json_response({"galleries": await asyncio.to_thread(_imp_collect)})
+
+        if action == "import_finish":  # 验收落库：暂存图库并入 target。同名图库（含暂存图库）= 自动合并，否则转正
             async with self._save_lock:
-                return json_response(self.import_files(pattern, payload.get("files", [])))
+                raw = str(payload.get("name", ""))
+                target = str(payload.get("target", "")).strip()
+                kw = raw[len(IMP_PREFIX):] if raw.startswith(IMP_PREFIX) else ""
+                src = self._imp_dir(kw) if kw else None
+                if src is None or not src.is_dir() or src.name != raw:
+                    return error_response("暂存图库不存在", status_code=404)
+                if not target:
+                    return error_response("目标图库名不能为空", status_code=400)
+                if target.startswith(IMP_PREFIX):  # 目标也是暂存图库：验收页「合并图库」逐个调用
+                    tkw = target[len(IMP_PREFIX):]
+                    dst = self._imp_dir(tkw)
+                    if dst is None or not dst.is_dir() or dst.name != target:
+                        return error_response("目标暂存图库不存在", status_code=404)
+                else:
+                    if self._safe_kw(target) != target:
+                        return error_response("目标图库名含非法字符", status_code=400)
+                    dst = self._galleries / target
+                if dst == src:
+                    return error_response("不能合并到自身", status_code=400)
+
+                def _finish() -> int:
+                    moved = 0
+                    if dst.exists():
+                        with os.scandir(src) as it:
+                            fs = [e.name for e in it if e.is_file() and e.name.lower().endswith(EXTS_TUP)]
+                        fs.sort(key=lambda n: self._image_key(src.name, n))
+                        for n in fs:
+                            p = src / n
+                            t = dst / f"{dst.name}-{self._next_num(dst, dst.name)}{p.suffix}"
+                            self._rename_image(p, t, src.name)  # pid/统计键从暂存前缀搬到目标图库
+                            moved += 1
+                    else:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        src.rename(dst)  # 转正：整个文件夹搬进图库区，文件与 pid/统计键去掉暂存前缀
+                        num_re = re.compile(rf"^{re.escape(src.name)}-(\d+)(\.[A-Za-z0-9]+)$")
+                        for p in sorted(dst.iterdir()):
+                            m2 = num_re.fullmatch(p.name) if p.is_file() else None
+                            if m2:
+                                self._rename_image(p, dst / f"{dst.name}-{m2.group(1)}{m2.group(2)}", src.name)
+                        moved = sum(1 for p in dst.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
+                    self._save_pids()
+                    try:
+                        self._save_stats()
+                    except OSError:
+                        pass
+                    shutil.rmtree(src, ignore_errors=True)
+                    for t in (self._tmp / "thumbs").glob(f"{src.name}_*.thumb.jpg"):
+                        t.unlink(missing_ok=True)  # 暂存期的缩略图缓存跟着作废
+                    return moved
+
+                moved = await asyncio.to_thread(_finish)
+                self._bump_stats_gen()          # 暂存图并入正式图库：图库数/图片数变了
+                self._invalidate_trigger_cache()  # 新库名/新角色名即时生效
+                self._sorted_names_cache = None   # 转正的新库名立刻参与拼音排序（不指望父目录 mtime 跨刻度）
+                return json_response({"ok": True, "name": dst.name, "moved": moved})
 
         if action == "get_runtime_settings":
             return json_response(self._runtime_settings())
@@ -1803,6 +2896,13 @@ class GalleryPlus(Star):
                 forward_threshold = min(max(int(payload.get("forward_threshold", DEFAULT_FORWARD_THRESHOLD)), 2), MAX_SEND_COUNT)
             except (TypeError, ValueError):
                 return error_response("发送数量或合并转发阈值必须是数字", status_code=400)
+            if "max_send" in payload:  # 缺键=旧调用：沿用已存的上限，别把新设置冲回缺省
+                try:
+                    max_send = min(max(int(payload.get("max_send")), 1), MAX_SEND_COUNT)
+                except (TypeError, ValueError):
+                    max_send = DEFAULT_MAX_SEND
+            else:
+                max_send = self._runtime_settings()["max_send"]
             synonyms = payload.get("synonyms", {})
             if not isinstance(synonyms, dict):
                 return error_response("同义词必须是对象", status_code=400)
@@ -1815,9 +2915,59 @@ class GalleryPlus(Star):
                 vals = list(dict.fromkeys(str(v).strip() for v in vals if str(v).strip() and str(v).strip() != canonical))
                 if vals:
                     clean[canonical] = vals
-            self._settings["runtime"] = {"send_count": send_count, "forward_threshold": forward_threshold, "synonyms": clean}
+            self._settings["runtime"] = {
+                "send_count": send_count,
+                "forward_threshold": forward_threshold,
+                "max_send": max_send,
+                "synonyms": clean,
+            }
             self._save_settings()
             return json_response({"ok": True, **self._runtime_settings()})
+
+        if action == "export_data":  # 导出全部数据：起后台线程打包，前端轮询 export_status + export_chunk 分块下载
+            try:
+                return json_response(self._export_start())
+            except Exception as e:  # 起线程失败也只回错误体，不把异常抛给 handler
+                return error_response(f"导出启动失败：{e}", status_code=500)
+
+        if action == "export_status":  # 导出状态：{state,name,size,path,error}，state ∈ idle/running/done/error/cancelled
+            return json_response(self._export_snapshot())
+
+        if action == "export_cancel":  # 打包阶段取消：置旗后立即回快照（state 仍 running，worker 尽快转 cancelled）
+            # idle/done/error/cancelled 原样返回：不删已完成的 zip（下载阶段的取消由前端本地停）
+            try:
+                with self._export_lock:
+                    if self._export.get("state") == "running":
+                        self._export_cancel.set()  # 重复点击幂等；下一轮 export_data 会 clear
+                return json_response(self._export_snapshot())
+            except Exception as e:  # handler 不抛异常
+                return error_response(f"取消导出失败：{e}", status_code=500)
+
+        if action == "export_chunk":  # 仅 state=done 可用：读 ZIP 的 [offset, offset+size) 分块，回 {b64,n,size}
+            st = self._export_snapshot()
+            if st["state"] != "done":
+                return error_response("还没有可下载的导出文件，请先导出", status_code=400)
+            try:
+                offset = max(int(payload.get("offset", 0)), 0)
+            except (TypeError, ValueError):
+                return error_response("offset 必须是数字", status_code=400)
+            try:  # 分块大小 1..8MB：bridge 单次体积可控，垃圾值回退 8MB
+                chunk = min(max(int(payload.get("size", EXPORT_CHUNK_MAX)), 1), EXPORT_CHUNK_MAX)
+            except (TypeError, ValueError):
+                chunk = EXPORT_CHUNK_MAX
+            path = Path(str(st["path"]))
+            try:
+                with path.open("rb") as f:
+                    total = os.fstat(f.fileno()).st_size
+                    if offset >= total:  # 越界：回空块（n=0，不算异常，前端按 n 累计判断结束）
+                        return json_response({"b64": "", "n": 0, "size": total})
+                    f.seek(offset)
+                    data = f.read(min(chunk, total - offset))
+            except OSError:
+                return error_response("导出文件已不存在，请重新导出", status_code=404)
+            except Exception as e:
+                return error_response(f"读取导出文件失败：{e}", status_code=500)
+            return json_response({"b64": base64.b64encode(data).decode(), "n": len(data), "size": total})
 
         if action == "get_settings":  # 水印设置：当前字体 + 可用字体列表（系统 + 上传池）
             return json_response(
@@ -1839,12 +2989,31 @@ class GalleryPlus(Star):
                 if name and name.lower() not in idx:
                     return error_response(f"系统中未找到字体文件: {name}", status_code=400)
                 self._settings[f"wm_font_{key}"] = name or default
+            if "ui_font" in payload:  # 界面字体：显式空串=恢复内置字体；没提供则不动（同 cjk/latin 的规矩）
+                self._settings["ui_font"] = str(payload.get("ui_font") or "").strip()[:200]
             try:  # 二级页每行张数（3~8），垃圾值忽略
                 self._settings["thumb_cols"] = min(max(int(payload.get("cols")), 3), 8)
             except (TypeError, ValueError):
                 pass
             self._save_settings()
             return json_response({"ok": True})
+
+        if action == "get_ui_font":  # 主页界面字体：只要当前值（空=内置字体）。别扫字体目录，开页要快
+            return json_response({"ui": str(self._settings.get("ui_font") or "")})
+
+        if action == "ui_font_options":  # 「WebUI 自定义」弹窗打开时才取候选字体显示名（不含路径）
+            # 字体索引要扫系统字体目录、PIL 还要逐个打开读族名，首次可能上百毫秒：丢线程池 + 别放主页启动路径
+            options = await asyncio.to_thread(_ui_font_options, str(self._fonts_dir))
+            return json_response({"options": options})
+
+        if action == "ui_font":  # 内嵌界面字体字节（页面 @font-face 静态资源不可用时的 bridge 兜底）
+            weight = str(payload.get("weight") or "M")
+            if weight not in UI_FONT_WEIGHTS:
+                return error_response("字重只能是 M 或 B", status_code=400)
+            src = await asyncio.to_thread(_ui_font_data_uri, weight)
+            if src is None:
+                return error_response("内嵌字体不存在", status_code=404)
+            return json_response({"src": src})
 
         if action == "upload_font":  # 管理员上传字体文件进字体池，之后可在下拉里选
             fname = Path(str(payload.get("name", ""))).name  # 只取文件名，防路径穿越
@@ -2040,15 +3209,16 @@ class GalleryPlus(Star):
         if action == "list_tags":  # 标签管理弹窗与各处打标下拉的数据源
             return json_response({"tags": self._tag_table(), "colors": TAG_COLORS})
 
-        if action == "save_tag":  # 新建/修改标签：颜色只认预设七色；名称不许重名（按名选择才有唯一解）
+        if action == "save_tag":  # 新建/修改标签：颜色接受 #rrggbb；名称不许重名（按名选择才有唯一解）
             table = self._tag_table()
             tid = str(payload.get("id") or "")
             name = str(payload.get("name") or "").strip()[:TAG_NAME_MAX]
-            color = str(payload.get("color") or "") or TAG_COLORS[0]
+            raw_color = str(payload.get("color") or "").strip()
+            color = _tag_color(raw_color) if raw_color else TAG_COLORS[0]
             if not name:
                 return error_response("标签名称不能为空")
-            if color not in TAG_COLORS:
-                return error_response("颜色必须是预设色之一")
+            if color is None:
+                return error_response("颜色必须是 #RRGGBB 十六进制色值")
             if tid and tid not in table:
                 return error_response("标签不存在", status_code=404)
             if any(isinstance(r, dict) and r.get("name") == name and i != tid for i, r in table.items()):
@@ -2101,6 +3271,12 @@ class GalleryPlus(Star):
                         return error_response("已有同名图库", status_code=400)
                     newd = self._galleries / new
                     d.rename(newd)
+                    self._bump_stats_gen()          # 图库名变了（统计按数量缓存，仍要作废）
+                    self._invalidate_trigger_cache()  # 旧关键词不能继续命中，新名字即时生效
+                    # 目录快照/名字排序缓存跟着名字走：旧名条目作废，新名不继承旧库任何快照
+                    self._dir_cache.pop(d.name, None)
+                    self._dir_cache.pop(new, None)
+                    self._sorted_names_cache = None
                     num_re = re.compile(rf"^{re.escape(d.name)}-(\d+)(\.[A-Za-z0-9]+)$")
                     for p in sorted(newd.iterdir()):
                         m = num_re.fullmatch(p.name) if p.is_file() else None
@@ -2184,23 +3360,102 @@ class GalleryPlus(Star):
                     pass
             return json_response({"ok": True, "done": done, "failed": failed})
 
-        if action == "list_all_settings":  # 批量设置页：全部图库的 水印+菜单配置 一次给全
-            out = []
-            for d in sorted(self._galleries.iterdir(), key=lambda p: pinyin_key(p.name)):
-                if not d.is_dir():
-                    continue
-                # ponytail: 不分页（只读目录名+settings，不碰图片内容）；图库上几百个再翻页
-                n = sum(1 for p in d.iterdir() if p.is_file() and p.suffix.lower() in EXTS)
-                out.append(
-                    {
-                        "name": d.name,
-                        "count": n,
-                        "wm": self._gallery_wm(d.name),
-                        "tag": self._tag_of(d.name),
-                        "menu": self._gallery_menu(d.name),
-                    }
-                )
-            return json_response({"galleries": out})
+        if action == "list_names":  # 选择模式「全选」：整库文件名（不带 pid，体积小；选择框只认名字）
+            d = self._kw_dir(str(payload.get("name", "")))
+            if not d or not d.is_dir():
+                return error_response("图库不存在或非法", status_code=404)
+            # 全选要整库文件名：目录列举走缓存 + 线程池（万张图时同步列举会卡住事件循环）
+            names = await asyncio.to_thread(self._gallery_files, d.name)
+            return json_response({"names": list(names)})
+
+        if action == "xfer_start":  # 移动/复制后台任务：校验通过就丢给 worker 线程，前端轮询进度
+            with self._xfer_lock:
+                if self._xfer.get("state") in ("running", "paused", "rolling"):
+                    return error_response("已有移动/复制任务正在进行", status_code=400)
+                op = str(payload.get("op", ""))
+                src = self._kw_dir(str(payload.get("src", "")))
+                dst = self._kw_dir(str(payload.get("dst", "")))
+                if op not in ("move", "copy"):
+                    return error_response("未知操作", status_code=400)
+                if not src or not src.is_dir() or not dst or not dst.is_dir():
+                    return error_response("图库不存在或非法", status_code=404)
+                if src.name == dst.name:
+                    return error_response("目标图库不能是当前图库", status_code=400)
+                names = [str(i) for i in payload.get("images", [])
+                         if Path(str(i)).name == str(i) and (src / str(i)).is_file()
+                         and str(i).lower().endswith(EXTS_TUP)]  # 信任边界：只认真实存在的裸文件名
+                if not names:
+                    return error_response("没有可处理的图片", status_code=400)
+                self._xfer = {
+                    "state": "running", "op": op, "src": src.name, "dst": dst.name,
+                    "total": len(names), "done": 0, "failed": [], "log": [],
+                    "bytes_r": 0, "bytes_w": 0, "ops": 0, "op_ms": 0.0,
+                    "rb_done": 0, "rb_total": 0, "error": "",
+                    "resume": threading.Event(), "cancel": False,
+                }
+                self._xfer["resume"].set()  # running 态 = 事件置位；暂停 = 清除
+                threading.Thread(target=self._xfer_worker, args=(self._xfer, src, dst, names), daemon=True).start()
+                return json_response({"ok": True, "total": len(names)})
+
+        if action == "xfer_status":  # 进度 + 磁盘信息（使用率=活动时间/实时读写速度/平均响应=整机当前窗口）
+            t = self._xfer
+            out = {k: t.get(k) for k in ("state", "op", "src", "dst", "total", "done", "failed",
+                                         "bytes_r", "bytes_w", "ops", "op_ms", "rb_done", "rb_total", "error")}
+            # 任务弹窗磁盘监控四格：每次轮询现采（前端 1s 一次）；旧键全部保留，前端旧逻辑不受影响
+            sample = disk_monitor()
+            out["disk"] = sample
+            out["usage"] = sample["usage"]  # 「磁盘使用率」= 活动时间占比（不是空间占用）
+            return json_response(out)
+
+        if action == "xfer_pause":  # 暂停/继续（value=true 暂停）
+            t = self._xfer
+            if t.get("state") not in ("running", "paused"):
+                return error_response("当前没有进行中的任务", status_code=400)
+            pause = bool(payload.get("value"))
+            if pause:
+                t["resume"].clear()
+                t["state"] = "paused"
+            else:
+                t["resume"].set()
+                t["state"] = "running"
+            return json_response({"ok": True, "state": t["state"]})
+
+        if action == "xfer_cancel":  # 取消：worker 把已完成的部分回退（复制删除/移动搬回），状态走 rolling→cancelled
+            t = self._xfer
+            if t.get("state") not in ("running", "paused"):
+                return error_response("当前没有进行中的任务", status_code=400)
+            t["cancel"] = True
+            t["resume"].set()  # 暂停中也要唤醒 worker 让它看到取消旗
+            return json_response({"ok": True})
+
+        if action == "list_all_settings":  # 批量管理页：全部图库的 水印+菜单配置 一次给全
+            def _collect() -> List[dict]:
+                out = []
+                for d in self._galleries.iterdir():
+                    if not d.is_dir():
+                        continue
+                    # os.scandir：Windows 上 Dirent 自带文件属性，is_file() 不再逐文件 stat——
+                    # 上万张图时 Path.iterdir()+is_file() 的 stat 风暴正是本页加载慢的根因
+                    with os.scandir(d) as it:
+                        n = sum(1 for e in it if e.is_file() and e.name.lower().endswith(EXTS_TUP))
+                    menu = self._gallery_menu(d.name)
+                    out.append(
+                        {
+                            "name": d.name,
+                            "count": n,
+                            "wm": self._gallery_wm(d.name),
+                            "tag": self._tag_of(d.name),
+                            "menu": menu,
+                        }
+                    )
+                # 排序：按「角色名每个字的拼音首字母」A→Z（role_sort_key，语义见该函数 docstring）；
+                # 首字母逐字相同（如「阿慈谷 日富美」并列）时用图库名的拼音兜底，保证顺序稳定。
+                out.sort(key=lambda r: (role_sort_key(r["menu"]["char"] or r["name"]), pinyin_key(r["name"])))
+                return out
+
+            # ponytail: 不分页（只读目录名+settings，不碰图片内容）；图库上几百个再翻页
+            galleries = await asyncio.to_thread(_collect)  # 磁盘遍历扔线程池，别堵事件循环
+            return json_response({"galleries": galleries})
 
         return error_response("未知操作", status_code=400)
 
@@ -2302,10 +3557,58 @@ def _font_cached(path: str, size: int):
     return ImageFont.truetype(path, size)
 
 
-def _resolve_font(name: str, size: int, extra_dir: str = ""):
-    """按设置名解析字体；缺文件时沿回退链找到第一个可用的，最终退回 PIL 默认。"""
+@lru_cache(maxsize=64)
+def _default_font(size: int):
+    """PIL 默认字体的 (字号) 缓存：字体索引一个可用字体都没有时，别每张图都重新 load_default。"""
     from PIL import ImageFont
 
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:  # 老 Pillow 的 load_default 不吃 size
+        return ImageFont.load_default()
+
+
+# ---------------- 内嵌界面字体（OPPO Sans，主页字体）----------------
+# 发版静态资源：页面优先 @font-face 相对 URL 加载；旧版 Pages 不服务静态资源时走 ui_font action 取字节兜底。
+UI_FONT_DIR = Path(__file__).parent / "pages" / "manager" / "fonts"
+UI_FONT_WEIGHTS = ("M", "B")  # Medium / Bold 两个字重
+_ui_font_src_cache: Dict[str, str] = {}
+
+
+def _ui_font_options(extra_dir: str) -> List[str]:
+    """界面字体可选显示名（系统字体 + 上传池，复用 _font_display，去重排序、不含路径）。
+
+    无 PIL / 字体索引读坏时退化为空列表：主页只剩内置字体可选，别整页报错。
+    """
+    try:
+        return sorted(set(_font_display(extra_dir).values()))
+    except Exception:
+        return []
+
+
+def _ui_font_data_uri(weight: str) -> Optional[str]:
+    """内嵌字体的 data URI；文件缺失返回 None。
+
+    ponytail: 发版静态资源不会变，进程内缓存到底；失败不缓存（补上文件后无需重启就能取到）。
+    """
+    cached = _ui_font_src_cache.get(weight)
+    if cached is not None:
+        return cached
+    try:
+        data = (UI_FONT_DIR / f"OPPOSans-{weight}.woff2").read_bytes()
+    except OSError:
+        return None
+    uri = "data:font/woff2;base64," + base64.b64encode(data).decode()
+    _ui_font_src_cache[weight] = uri
+    return uri
+
+
+def _resolve_font(name: str, size: int, extra_dir: str = ""):
+    """按设置名解析字体；缺文件时沿回退链找到第一个可用的，最终退回 PIL 默认。
+
+    加载结果按 (绝对路径, 字号) 缓存（_font_cached）：_font_index 里存的就是绝对路径，
+    所以 upload_font 的 cache_clear() 之后老条目依然正确，改字体名/换字号才会重新加载。
+    """
     idx = _font_index(extra_dir)
     chain = [name.lower(), *FONT_CANDIDATES]
     for n in chain:
@@ -2315,7 +3618,4 @@ def _resolve_font(name: str, size: int, extra_dir: str = ""):
                 return _font_cached(p, size)
             except Exception:
                 continue
-    try:
-        return ImageFont.load_default(size)
-    except TypeError:
-        return ImageFont.load_default()
+    return _default_font(size)
